@@ -256,6 +256,13 @@ def _parse_allowed_keys_env() -> List[str]:
 ALLOWED_API_KEYS: List[str] = _parse_allowed_keys_env()
 MAX_ERROR_COUNT: int = int(os.getenv("MAX_ERROR_COUNT", "100"))
 
+def _is_console_enabled() -> bool:
+    """检查是否启用管理控制台"""
+    console_env = os.getenv("ENABLE_CONSOLE", "true").strip().lower()
+    return console_env not in ("false", "0", "no", "disabled")
+
+CONSOLE_ENABLED: bool = _is_console_enabled()
+
 def _extract_bearer(token_header: Optional[str]) -> Optional[str]:
     if not token_header:
         return None
@@ -803,220 +810,222 @@ async def _create_account_from_tokens(
             row = await cursor.fetchone()
             return _row_to_dict(row)
 
-@app.post("/v2/auth/start")
-async def auth_start(body: AuthStartBody):
-    """
-    Start device authorization and return verification URL for user login.
-    Session lifetime capped at 5 minutes on claim.
-    """
-    try:
-        cid, csec = await register_client_min()
-        dev = await device_authorize(cid, csec)
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"OIDC error: {str(e)}")
+# 管理控制台相关端点 - 仅在启用时注册
+if CONSOLE_ENABLED:
+    @app.post("/v2/auth/start")
+    async def auth_start(body: AuthStartBody):
+        """
+        Start device authorization and return verification URL for user login.
+        Session lifetime capped at 5 minutes on claim.
+        """
+        try:
+            cid, csec = await register_client_min()
+            dev = await device_authorize(cid, csec)
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"OIDC error: {str(e)}")
 
-    auth_id = str(uuid.uuid4())
-    sess = {
-        "clientId": cid,
-        "clientSecret": csec,
-        "deviceCode": dev.get("deviceCode"),
-        "interval": int(dev.get("interval", 1)),
-        "expiresIn": int(dev.get("expiresIn", 600)),
-        "verificationUriComplete": dev.get("verificationUriComplete"),
-        "userCode": dev.get("userCode"),
-        "startTime": int(time.time()),
-        "label": body.label,
-        "enabled": True if body.enabled is None else bool(body.enabled),
-        "status": "pending",
-        "error": None,
-        "accountId": None,
-    }
-    AUTH_SESSIONS[auth_id] = sess
-    return {
-        "authId": auth_id,
-        "verificationUriComplete": sess["verificationUriComplete"],
-        "userCode": sess["userCode"],
-        "expiresIn": sess["expiresIn"],
-        "interval": sess["interval"],
-    }
-
-@app.get("/v2/auth/status/{auth_id}")
-async def auth_status(auth_id: str):
-    sess = AUTH_SESSIONS.get(auth_id)
-    if not sess:
-        raise HTTPException(status_code=404, detail="Auth session not found")
-    now_ts = int(time.time())
-    deadline = sess["startTime"] + min(int(sess.get("expiresIn", 600)), 300)
-    remaining = max(0, deadline - now_ts)
-    return {
-        "status": sess.get("status"),
-        "remaining": remaining,
-        "error": sess.get("error"),
-        "accountId": sess.get("accountId"),
-    }
-
-@app.post("/v2/auth/claim/{auth_id}")
-async def auth_claim(auth_id: str):
-    """
-    Block up to 5 minutes to exchange the device code for tokens after user completed login.
-    On success, creates an enabled account and returns it.
-    """
-    sess = AUTH_SESSIONS.get(auth_id)
-    if not sess:
-        raise HTTPException(status_code=404, detail="Auth session not found")
-    if sess.get("status") in ("completed", "timeout", "error"):
+        auth_id = str(uuid.uuid4())
+        sess = {
+            "clientId": cid,
+            "clientSecret": csec,
+            "deviceCode": dev.get("deviceCode"),
+            "interval": int(dev.get("interval", 1)),
+            "expiresIn": int(dev.get("expiresIn", 600)),
+            "verificationUriComplete": dev.get("verificationUriComplete"),
+            "userCode": dev.get("userCode"),
+            "startTime": int(time.time()),
+            "label": body.label,
+            "enabled": True if body.enabled is None else bool(body.enabled),
+            "status": "pending",
+            "error": None,
+            "accountId": None,
+        }
+        AUTH_SESSIONS[auth_id] = sess
         return {
-            "status": sess["status"],
-            "accountId": sess.get("accountId"),
+            "authId": auth_id,
+            "verificationUriComplete": sess["verificationUriComplete"],
+            "userCode": sess["userCode"],
+            "expiresIn": sess["expiresIn"],
+            "interval": sess["interval"],
+        }
+
+    @app.get("/v2/auth/status/{auth_id}")
+    async def auth_status(auth_id: str):
+        sess = AUTH_SESSIONS.get(auth_id)
+        if not sess:
+            raise HTTPException(status_code=404, detail="Auth session not found")
+        now_ts = int(time.time())
+        deadline = sess["startTime"] + min(int(sess.get("expiresIn", 600)), 300)
+        remaining = max(0, deadline - now_ts)
+        return {
+            "status": sess.get("status"),
+            "remaining": remaining,
             "error": sess.get("error"),
+            "accountId": sess.get("accountId"),
         }
-    try:
-        toks = await poll_token_device_code(
-            sess["clientId"],
-            sess["clientSecret"],
-            sess["deviceCode"],
-            sess["interval"],
-            sess["expiresIn"],
-            max_timeout_sec=300,  # 5 minutes
-        )
-        access_token = toks.get("accessToken")
-        refresh_token = toks.get("refreshToken")
-        if not access_token:
-            raise HTTPException(status_code=502, detail="No accessToken returned from OIDC")
 
-        acc = await _create_account_from_tokens(
-            sess["clientId"],
-            sess["clientSecret"],
-            access_token,
-            refresh_token,
-            sess.get("label"),
-            sess.get("enabled", True),
-        )
-        sess["status"] = "completed"
-        sess["accountId"] = acc["id"]
-        return {
-            "status": "completed",
-            "account": acc,
-        }
-    except TimeoutError:
-        sess["status"] = "timeout"
-        raise HTTPException(status_code=408, detail="Authorization timeout (5 minutes)")
-    except httpx.HTTPError as e:
-        sess["status"] = "error"
-        sess["error"] = str(e)
-        raise HTTPException(status_code=502, detail=f"OIDC error: {str(e)}")
+    @app.post("/v2/auth/claim/{auth_id}")
+    async def auth_claim(auth_id: str):
+        """
+        Block up to 5 minutes to exchange the device code for tokens after user completed login.
+        On success, creates an enabled account and returns it.
+        """
+        sess = AUTH_SESSIONS.get(auth_id)
+        if not sess:
+            raise HTTPException(status_code=404, detail="Auth session not found")
+        if sess.get("status") in ("completed", "timeout", "error"):
+            return {
+                "status": sess["status"],
+                "accountId": sess.get("accountId"),
+                "error": sess.get("error"),
+            }
+        try:
+            toks = await poll_token_device_code(
+                sess["clientId"],
+                sess["clientSecret"],
+                sess["deviceCode"],
+                sess["interval"],
+                sess["expiresIn"],
+                max_timeout_sec=300,  # 5 minutes
+            )
+            access_token = toks.get("accessToken")
+            refresh_token = toks.get("refreshToken")
+            if not access_token:
+                raise HTTPException(status_code=502, detail="No accessToken returned from OIDC")
 
-# ------------------------------------------------------------------------------
-# Accounts Management API
-# ------------------------------------------------------------------------------
+            acc = await _create_account_from_tokens(
+                sess["clientId"],
+                sess["clientSecret"],
+                access_token,
+                refresh_token,
+                sess.get("label"),
+                sess.get("enabled", True),
+            )
+            sess["status"] = "completed"
+            sess["accountId"] = acc["id"]
+            return {
+                "status": "completed",
+                "account": acc,
+            }
+        except TimeoutError:
+            sess["status"] = "timeout"
+            raise HTTPException(status_code=408, detail="Authorization timeout (5 minutes)")
+        except httpx.HTTPError as e:
+            sess["status"] = "error"
+            sess["error"] = str(e)
+            raise HTTPException(status_code=502, detail=f"OIDC error: {str(e)}")
 
-@app.post("/v2/accounts")
-async def create_account(body: AccountCreate):
-    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-    acc_id = str(uuid.uuid4())
-    other_str = json.dumps(body.other, ensure_ascii=False) if body.other is not None else None
-    enabled_val = 1 if (body.enabled is None or body.enabled) else 0
-    async with _conn() as conn:
-        conn.row_factory = aiosqlite.Row
-        await conn.execute(
-            """
-            INSERT INTO accounts (id, label, clientId, clientSecret, refreshToken, accessToken, other, last_refresh_time, last_refresh_status, created_at, updated_at, enabled)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                acc_id,
-                body.label,
-                body.clientId,
-                body.clientSecret,
-                body.refreshToken,
-                body.accessToken,
-                other_str,
-                None,
-                "never",
-                now,
-                now,
-                enabled_val,
-            ),
-        )
-        await conn.commit()
-        async with conn.execute("SELECT * FROM accounts WHERE id=?", (acc_id,)) as cursor:
-            row = await cursor.fetchone()
-            return _row_to_dict(row)
+    # ------------------------------------------------------------------------------
+    # Accounts Management API
+    # ------------------------------------------------------------------------------
 
-@app.get("/v2/accounts")
-async def list_accounts():
-    async with _conn() as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT * FROM accounts ORDER BY created_at DESC") as cursor:
-            rows = await cursor.fetchall()
-            return [_row_to_dict(r) for r in rows]
+    @app.post("/v2/accounts")
+    async def create_account(body: AccountCreate):
+        now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        acc_id = str(uuid.uuid4())
+        other_str = json.dumps(body.other, ensure_ascii=False) if body.other is not None else None
+        enabled_val = 1 if (body.enabled is None or body.enabled) else 0
+        async with _conn() as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute(
+                """
+                INSERT INTO accounts (id, label, clientId, clientSecret, refreshToken, accessToken, other, last_refresh_time, last_refresh_status, created_at, updated_at, enabled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    acc_id,
+                    body.label,
+                    body.clientId,
+                    body.clientSecret,
+                    body.refreshToken,
+                    body.accessToken,
+                    other_str,
+                    None,
+                    "never",
+                    now,
+                    now,
+                    enabled_val,
+                ),
+            )
+            await conn.commit()
+            async with conn.execute("SELECT * FROM accounts WHERE id=?", (acc_id,)) as cursor:
+                row = await cursor.fetchone()
+                return _row_to_dict(row)
 
-@app.get("/v2/accounts/{account_id}")
-async def get_account_detail(account_id: str):
-    return await get_account(account_id)
+    @app.get("/v2/accounts")
+    async def list_accounts():
+        async with _conn() as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute("SELECT * FROM accounts ORDER BY created_at DESC") as cursor:
+                rows = await cursor.fetchall()
+                return [_row_to_dict(r) for r in rows]
 
-@app.delete("/v2/accounts/{account_id}")
-async def delete_account(account_id: str):
-    async with _conn() as conn:
-        cur = await conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
-        await conn.commit()
-        if cur.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Account not found")
-        return {"deleted": account_id}
-
-@app.patch("/v2/accounts/{account_id}")
-async def update_account(account_id: str, body: AccountUpdate):
-    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-    fields = []
-    values: List[Any] = []
-
-    if body.label is not None:
-        fields.append("label=?"); values.append(body.label)
-    if body.clientId is not None:
-        fields.append("clientId=?"); values.append(body.clientId)
-    if body.clientSecret is not None:
-        fields.append("clientSecret=?"); values.append(body.clientSecret)
-    if body.refreshToken is not None:
-        fields.append("refreshToken=?"); values.append(body.refreshToken)
-    if body.accessToken is not None:
-        fields.append("accessToken=?"); values.append(body.accessToken)
-    if body.other is not None:
-        fields.append("other=?"); values.append(json.dumps(body.other, ensure_ascii=False))
-    if body.enabled is not None:
-        fields.append("enabled=?"); values.append(1 if body.enabled else 0)
-
-    if not fields:
+    @app.get("/v2/accounts/{account_id}")
+    async def get_account_detail(account_id: str):
         return await get_account(account_id)
 
-    fields.append("updated_at=?"); values.append(now)
-    values.append(account_id)
+    @app.delete("/v2/accounts/{account_id}")
+    async def delete_account(account_id: str):
+        async with _conn() as conn:
+            cur = await conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+            await conn.commit()
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Account not found")
+            return {"deleted": account_id}
 
-    async with _conn() as conn:
-        conn.row_factory = aiosqlite.Row
-        cur = await conn.execute(f"UPDATE accounts SET {', '.join(fields)} WHERE id=?", values)
-        await conn.commit()
-        if cur.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Account not found")
-        async with conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)) as cursor:
-            row = await cursor.fetchone()
-            return _row_to_dict(row)
+    @app.patch("/v2/accounts/{account_id}")
+    async def update_account(account_id: str, body: AccountUpdate):
+        now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        fields = []
+        values: List[Any] = []
 
-@app.post("/v2/accounts/{account_id}/refresh")
-async def manual_refresh(account_id: str):
-    return await refresh_access_token_in_db(account_id)
+        if body.label is not None:
+            fields.append("label=?"); values.append(body.label)
+        if body.clientId is not None:
+            fields.append("clientId=?"); values.append(body.clientId)
+        if body.clientSecret is not None:
+            fields.append("clientSecret=?"); values.append(body.clientSecret)
+        if body.refreshToken is not None:
+            fields.append("refreshToken=?"); values.append(body.refreshToken)
+        if body.accessToken is not None:
+            fields.append("accessToken=?"); values.append(body.accessToken)
+        if body.other is not None:
+            fields.append("other=?"); values.append(json.dumps(body.other, ensure_ascii=False))
+        if body.enabled is not None:
+            fields.append("enabled=?"); values.append(1 if body.enabled else 0)
 
-# ------------------------------------------------------------------------------
-# Simple Frontend (minimal dev test page; full UI in v2/frontend/index.html)
-# ------------------------------------------------------------------------------
+        if not fields:
+            return await get_account(account_id)
 
-# Frontend inline HTML removed; serving ./frontend/index.html instead (see route below)
+        fields.append("updated_at=?"); values.append(now)
+        values.append(account_id)
 
-@app.get("/", response_class=FileResponse)
-def index():
-    path = BASE_DIR / "frontend" / "index.html"
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="frontend/index.html not found")
-    return FileResponse(str(path))
+        async with _conn() as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(f"UPDATE accounts SET {', '.join(fields)} WHERE id=?", values)
+            await conn.commit()
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Account not found")
+            async with conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)) as cursor:
+                row = await cursor.fetchone()
+                return _row_to_dict(row)
+
+    @app.post("/v2/accounts/{account_id}/refresh")
+    async def manual_refresh(account_id: str):
+        return await refresh_access_token_in_db(account_id)
+
+    # ------------------------------------------------------------------------------
+    # Simple Frontend (minimal dev test page; full UI in v2/frontend/index.html)
+    # ------------------------------------------------------------------------------
+
+    # Frontend inline HTML removed; serving ./frontend/index.html instead (see route below)
+
+    @app.get("/", response_class=FileResponse)
+    def index():
+        path = BASE_DIR / "frontend" / "index.html"
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="frontend/index.html not found")
+        return FileResponse(str(path))
 
 # ------------------------------------------------------------------------------
 # Health

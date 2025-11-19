@@ -73,6 +73,10 @@ MAX_ERROR_COUNT=100
 # HTTP代理设置（留空不使用代理）
 # 例如：HTTP_PROXY="http://127.0.0.1:7890"
 HTTP_PROXY=""
+
+# 管理控制台开关（默认启用）
+# 设置为 "false" 或 "0" 可禁用管理控制台和相关API端点
+ENABLE_CONSOLE="true"
 ```
 
 **配置要点：**
@@ -80,6 +84,7 @@ HTTP_PROXY=""
 - `OPENAI_KEYS` 设置后：仅白名单中的 key 可访问 API
 - API Key 仅用于访问控制，不映射到特定账号
 - 账号选择策略：从所有启用账号中随机选择
+- `ENABLE_CONSOLE` 设为 `false` 或 `0`：禁用 Web 管理控制台和账号管理 API
 
 ### 3. 启动服务
 
@@ -535,6 +540,7 @@ with client.messages.stream(
 | `OPENAI_KEYS` | API Key 白名单（逗号分隔） | 空（开发模式） | `"key1,key2"` |
 | `MAX_ERROR_COUNT` | 错误次数阈值 | 100 | `50` |
 | `HTTP_PROXY` | HTTP代理地址 | 空 | `"http://127.0.0.1:7890"` |
+| `ENABLE_CONSOLE` | 管理控制台开关 | `"true"` | `"false"` |
 
 ### 数据库结构
 
@@ -744,4 +750,4 @@ server {
 
 - [amq2api](https://github.com/mucsbr/amq2api) - Claude 消息格式转换参考
 - FastAPI - 现代 Python Web 框架
-- Amazon Q Developer - 底层 AI 服务"����˫��������" 
+- Amazon Q Developer - 底层 AI 服务
