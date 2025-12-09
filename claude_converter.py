@@ -458,9 +458,6 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
         else:
             prompt_content = extract_text_from_content(content)
 
-        if thinking_enabled:
-            prompt_content = _append_thinking_hint(prompt_content)
-            
     # 3. Context
     user_ctx = {
         "envState": {
@@ -516,7 +513,11 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
                 "--- SYSTEM PROMPT END ---\n\n"
                 f"{formatted_content}"
             )
-            
+
+    # Append thinking hint at the very end, outside all structured blocks
+    if thinking_enabled:
+        formatted_content = _append_thinking_hint(formatted_content)
+
     # 5. Model
     model_id = map_model_name(req.model)
     
