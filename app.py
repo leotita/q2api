@@ -564,16 +564,27 @@ def _sse_format(obj: Dict[str, Any]) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 @app.post("/v1/messages")
-async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(require_account)):
+async def claude_messages(
+    req: ClaudeRequest,
+    account: Dict[str, Any] = Depends(require_account),
+    x_conversation_id: Optional[str] = Header(default=None, alias="x-conversation-id")
+):
     """
     Claude-compatible messages endpoint.
     """
     # 1. Convert request
+    requested_conversation_id = req.conversation_id or x_conversation_id
     try:
-        aq_request = convert_claude_to_amazonq_request(req)
+        aq_request = convert_claude_to_amazonq_request(req, conversation_id=requested_conversation_id)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=f"Request conversion failed: {str(e)}")
+
+    conversation_state = aq_request.get("conversationState", {})
+    conversation_id = conversation_state.get("conversationId")
+    response_headers: Dict[str, str] = {}
+    if conversation_id:
+        response_headers["x-conversation-id"] = conversation_id
 
     # Always stream from upstream to get full event details
     event_iter = None
@@ -652,7 +663,11 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                 raise
 
         if req.stream:
-            return StreamingResponse(event_generator(), media_type="text/event-stream")
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/event-stream",
+                headers=response_headers or None
+            )
         else:
             # Accumulate for non-streaming
             # This is a bit complex because we need to reconstruct the full response object
@@ -738,7 +753,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                     c.pop("partial_json", None)
                     final_content_cleaned.append(c)
 
-            return JSONResponse(content={
+            response_body = {
                 "id": f"msg_{uuid.uuid4()}",
                 "type": "message",
                 "role": "assistant",
@@ -747,7 +762,11 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                 "stop_reason": stop_reason,
                 "stop_sequence": None,
                 "usage": usage
-            })
+            }
+            if conversation_id:
+                response_body["conversation_id"] = conversation_id
+                response_body["conversationId"] = conversation_id
+            return JSONResponse(content=response_body, headers=response_headers or None)
 
     except Exception as e:
         # Ensure event_iter (if created) is closed to release upstream connection
