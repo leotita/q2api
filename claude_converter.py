@@ -310,13 +310,10 @@ def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = Fals
                             if tool_results is None:
                                 tool_results = []
                             result = _process_tool_result_block(block)
-                            # Merge if exists
-                            existing = next((r for r in tool_results if r["toolUseId"] == result["toolUseId"]), None)
-                            if existing:
-                                existing["content"].extend(result["content"])
-                                if result["status"] == "error":
-                                    existing["status"] = "error"
-                            else:
+                            # 关键修复：跳过重复的 toolUseId（而不是合并）
+                            # 参考 AIClient-2-API-main 的实现：Kiro API 不接受重复的 toolUseId
+                            existing_ids = {r["toolUseId"] for r in tool_results}
+                            if result["toolUseId"] not in existing_ids:
                                 tool_results.append(result)
                 text_content = "\n".join(text_parts)
             else:
@@ -484,9 +481,14 @@ def _detect_tool_call_loop(messages: List[ClaudeMessage], threshold: int = 3) ->
     return None
 
 def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optional[str] = None) -> Dict[str, Any]:
-    """Convert ClaudeRequest to Amazon Q request body."""
-    if conversation_id is None:
-        conversation_id = str(uuid.uuid4())
+    """Convert ClaudeRequest to Amazon Q request body.
+
+    关键修复：每次请求都生成新的 conversationId
+    参考 AIClient-2-API-main 的实现：每次都生成新的 UUID，不复用传入的
+    这样可以避免 Kiro API 因为相同 conversationId 导致的状态混乱
+    """
+    # 每次都生成新的 conversationId，忽略传入的值
+    conversation_id = str(uuid.uuid4())
 
     # Detect infinite tool call loops
     loop_error = _detect_tool_call_loop(req.messages, threshold=3)
@@ -505,12 +507,16 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
             aq_tools.append(convert_tool(t))
             
     # 2. Current Message (last user message)
+    # 关键修复：处理最后一条消息是 assistant 的情况
+    # 参考 AIClient-2-API-main 的实现：如果最后一条消息是 assistant，
+    # 需要将其移入 history 并创建一个 "Continue" 的 user 消息
     last_msg = req.messages[-1] if req.messages else None
     prompt_content = ""
     tool_results = None
     has_tool_result = False
     images = None
-    
+    last_msg_is_assistant = last_msg and last_msg.role == "assistant"
+
     if last_msg and last_msg.role == "user":
         content = last_msg.content
         images = extract_images_from_content(content)
@@ -529,13 +535,10 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
                         if tool_results is None:
                             tool_results = []
                         result = _process_tool_result_block(block)
-                        # Merge if exists
-                        existing = next((r for r in tool_results if r["toolUseId"] == result["toolUseId"]), None)
-                        if existing:
-                            existing["content"].extend(result["content"])
-                            if result["status"] == "error":
-                                existing["status"] = "error"
-                        else:
+                        # 关键修复：跳过重复的 toolUseId（而不是合并）
+                        # 参考 AIClient-2-API-main 的实现：Kiro API 不接受重复的 toolUseId
+                        existing_ids = {r["toolUseId"] for r in tool_results}
+                        if result["toolUseId"] not in existing_ids:
                             tool_results.append(result)
             prompt_content = "\n".join(text_parts)
         else:
@@ -554,9 +557,13 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
         user_ctx["toolResults"] = tool_results
         
     # 4. Format Content
-    formatted_content = ""
-    if has_tool_result and not prompt_content:
-        formatted_content = ""
+    # 关键修复：当有 tool_result 但没有文本时，content 不能为空
+    # 参考 AIClient-2-API-main 的实现：确保 content 永远不为空
+    # 关键修复：当最后一条消息是 assistant 时，创建 "Continue" user 消息
+    if last_msg_is_assistant:
+        formatted_content = "Continue"
+    elif has_tool_result and not prompt_content:
+        formatted_content = "Tool results provided."
     else:
         formatted_content = (
             "--- CONTEXT ENTRY BEGIN ---\n"
@@ -615,7 +622,12 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
         user_input_msg["images"] = images
         
     # 7. History
-    history_msgs = req.messages[:-1] if len(req.messages) > 1 else []
+    # 关键修复：当最后一条消息是 assistant 时，将所有消息都移入 history
+    # 参考 AIClient-2-API-main 的实现（claude-kiro.js 第 750-781 行）
+    if last_msg_is_assistant:
+        history_msgs = req.messages  # 包括最后一条 assistant 消息
+    else:
+        history_msgs = req.messages[:-1] if len(req.messages) > 1 else []
     aq_history = process_history(history_msgs, thinking_enabled=thinking_enabled, hint=THINKING_HINT)
 
     # Validate history alternation to prevent infinite loops
