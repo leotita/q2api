@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, List, Any, AsyncGenerator, Tuple
 
-from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, FileResponse
 from pydantic import BaseModel
@@ -280,6 +280,9 @@ CONSOLE_ENABLED: bool = _is_console_enabled()
 
 # Admin authentication configuration
 ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin")
+LOGIN_MAX_ATTEMPTS: int = 5
+LOGIN_LOCKOUT_SECONDS: int = 3600  # 1 hour
+_login_failures: Dict[str, Dict] = {}  # {ip: {"count": int, "locked_until": float}}
 
 def _extract_bearer(token_header: Optional[str]) -> Optional[str]:
     if not token_header:
@@ -336,8 +339,9 @@ async def resolve_account_for_key(bearer_key: Optional[str]) -> Dict[str, Any]:
     Authorize request by OPENAI_KEYS (if configured), then select an AWS account.
     Selection strategy: random among all enabled accounts. Authorization key does NOT map to any account.
     """
-    # Authorization
-    if ALLOWED_API_KEYS:
+    # Authorization: allow admin password to bypass OPENAI_KEYS check (for console testing)
+    is_admin = bearer_key and bearer_key == ADMIN_PASSWORD
+    if ALLOWED_API_KEYS and not is_admin:
         if not bearer_key or bearer_key not in ALLOWED_API_KEYS:
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
@@ -1002,17 +1006,46 @@ if CONSOLE_ENABLED:
     # ------------------------------------------------------------------------------
 
     @app.post("/api/login", response_model=AdminLoginResponse)
-    async def admin_login(request: AdminLoginRequest) -> AdminLoginResponse:
-        """Admin login endpoint - password only"""
+    async def admin_login(request: AdminLoginRequest, req: Request) -> AdminLoginResponse:
+        """Admin login endpoint - password only, with rate limiting"""
+        client_ip = req.client.host if req.client else "unknown"
+        now = time.time()
+
+        # Check if locked
+        if client_ip in _login_failures:
+            info = _login_failures[client_ip]
+            if info.get("locked_until", 0) > now:
+                remaining = int(info["locked_until"] - now)
+                return AdminLoginResponse(
+                    success=False,
+                    message=f"账号已锁定，请 {remaining // 60} 分钟后重试"
+                )
+
         if request.password == ADMIN_PASSWORD:
+            # Clear failures on success
+            _login_failures.pop(client_ip, None)
             return AdminLoginResponse(
                 success=True,
                 message="Login successful"
             )
         else:
+            # Track failure
+            if client_ip not in _login_failures:
+                _login_failures[client_ip] = {"count": 0, "locked_until": 0}
+            _login_failures[client_ip]["count"] += 1
+            count = _login_failures[client_ip]["count"]
+
+            if count >= LOGIN_MAX_ATTEMPTS:
+                _login_failures[client_ip]["locked_until"] = now + LOGIN_LOCKOUT_SECONDS
+                return AdminLoginResponse(
+                    success=False,
+                    message=f"密码错误次数过多，账号已锁定1小时"
+                )
+
+            remaining = LOGIN_MAX_ATTEMPTS - count
             return AdminLoginResponse(
                 success=False,
-                message="Invalid password"
+                message=f"密码错误，还剩 {remaining} 次尝试机会"
             )
 
     @app.get("/login", response_class=FileResponse)
