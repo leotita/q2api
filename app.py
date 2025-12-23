@@ -1243,6 +1243,59 @@ if CONSOLE_ENABLED:
         accounts = [_row_to_dict(r) for r in rows]
         return {"accounts": accounts, "count": len(accounts)}
 
+    # ------------------------------------------------------------------------------
+    # Usage Query
+    # ------------------------------------------------------------------------------
+
+    USAGE_LIMITS_URL = "https://q.{region}.amazonaws.com/getUsageLimits"
+
+    async def _get_account_usage(account: Dict[str, Any], client: httpx.AsyncClient) -> Dict[str, Any]:
+        """获取单个账号的使用量"""
+        result = {"account_id": account["id"], "label": account.get("label", ""), "success": False, "usage": None, "error": None}
+
+        access_token = account.get("accessToken")
+        if not access_token:
+            result["error"] = "无访问令牌"
+            return result
+
+        region = "us-east-1"
+        url = USAGE_LIMITS_URL.format(region=region)
+        params = {"isEmailRequired": "true", "origin": "AI_EDITOR", "resourceType": "AGENTIC_REQUEST"}
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "amz-sdk-invocation-id": str(uuid.uuid4()),
+            "amz-sdk-request": "attempt=1; max=1",
+        }
+
+        try:
+            resp = await client.get(url, params=params, headers=headers, timeout=30.0)
+            if resp.status_code == 200:
+                result["success"] = True
+                result["usage"] = resp.json()
+            else:
+                result["error"] = f"HTTP {resp.status_code}"
+        except Exception as e:
+            result["error"] = str(e)
+
+        return result
+
+    @app.get("/v2/accounts/usage")
+    async def get_all_accounts_usage(_: bool = Depends(verify_admin_password)):
+        """查询所有启用账号的使用量"""
+        rows = await _db.fetchall("SELECT * FROM accounts WHERE enabled=1 ORDER BY created_at DESC")
+        accounts = [_row_to_dict(r) for r in rows]
+
+        if not accounts:
+            return {"results": [], "total": 0, "success_count": 0}
+
+        results = []
+        async with httpx.AsyncClient() as client:
+            tasks = [_get_account_usage(acc, client) for acc in accounts]
+            results = await asyncio.gather(*tasks)
+
+        success_count = sum(1 for r in results if r["success"])
+        return {"results": results, "total": len(results), "success_count": success_count}
+
     @app.get("/v2/accounts/{account_id}")
     async def get_account_detail(account_id: str, _: bool = Depends(verify_admin_password)):
         return await get_account(account_id)

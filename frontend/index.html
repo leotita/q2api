@@ -204,6 +204,7 @@
         <h2>账号管理 <span id="accountCount" style="font-size: 0.8em; color: #666;"></span></h2>
         <div class="row">
           <button class="btn-secondary" onclick="loadAccounts()">刷新列表</button>
+          <button class="btn-secondary" onclick="queryUsage()" id="usageBtn">查询使用量</button>
           <div style="margin-left: 20px;">
             <label><input type="radio" name="accountFilter" value="all" checked onchange="loadAccounts()"> 全部</label>
             <label style="margin-left: 10px;"><input type="radio" name="accountFilter" value="enabled" onchange="loadAccounts()"> 已启用</label>
@@ -729,6 +730,141 @@ async function refreshAccount(id){
   } catch(e){
     alert('刷新失败：' + e);
   }
+}
+
+// 使用量查询
+let usageModal = null;
+async function queryUsage(){
+  const btn = document.getElementById('usageBtn');
+  btn.disabled = true;
+  btn.textContent = '查询中...';
+  try {
+    const r = await authFetch(api('/v2/accounts/usage'));
+    if (!r.ok) { throw new Error(await r.text()); }
+    const data = await r.json();
+    showUsageModal(data);
+  } catch(e) {
+    alert('查询使用量失败：' + e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '查询使用量';
+  }
+}
+
+function showUsageModal(data) {
+  if (usageModal) usageModal.remove();
+
+  const modal = document.createElement('div');
+  modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:1000;display:flex;align-items:center;justify-content:center;';
+
+  let html = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;max-width:800px;max-height:80vh;overflow:auto;min-width:400px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <h2 style="margin:0;color:#c5d4ff;">使用量查询结果</h2>
+      <button onclick="if(usageModal){usageModal.remove();usageModal=null;}" style="background:transparent;border:none;color:var(--muted);font-size:24px;cursor:pointer;">&times;</button>
+    </div>
+    <div style="color:var(--muted);margin-bottom:16px;">成功: ${data.success_count}/${data.total}</div>`;
+
+  if (data.results && data.results.length > 0) {
+    for (const r of data.results) {
+      const label = r.label || r.account_id.slice(0,8);
+      const statusColor = r.success ? 'var(--ok)' : 'var(--danger)';
+      html += `<div style="border:1px solid var(--border);border-radius:12px;padding:12px;margin-bottom:12px;background:rgba(12,19,34,0.6);">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-weight:600;color:var(--text);">${label}</span>
+          <span style="color:${statusColor};font-size:12px;">${r.success ? '成功' : r.error || '失败'}</span>
+        </div>`;
+
+      if (r.success && r.usage) {
+        const u = r.usage;
+        // 显示用户信息
+        if (u.userInfo?.email) {
+          html += `<div style="color:var(--muted);font-size:12px;margin-top:8px;">邮箱: ${u.userInfo.email}</div>`;
+        }
+        // 显示订阅信息
+        if (u.subscriptionInfo?.subscriptionTitle) {
+          html += `<div style="color:var(--accent);font-size:12px;">订阅: ${u.subscriptionInfo.subscriptionTitle}</div>`;
+        }
+        // 显示使用量明细
+        if (u.usageBreakdownList && u.usageBreakdownList.length > 0) {
+          for (const b of u.usageBreakdownList) {
+            const used = b.currentUsageWithPrecision ?? b.currentUsage ?? 0;
+            const limit = b.usageLimitWithPrecision ?? b.usageLimit ?? 0;
+            const pct = limit > 0 ? Math.round(used / limit * 100) : 0;
+            const barColor = pct > 80 ? 'var(--danger)' : pct > 50 ? 'var(--warn)' : 'var(--ok)';
+            // 格式化重置时间
+            let resetTimeStr = '';
+            if (b.nextDateReset) {
+              const resetDate = new Date(b.nextDateReset * 1000);
+              resetTimeStr = resetDate.toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+            }
+            html += `<div style="margin-top:8px;">
+              <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text);">
+                <span>${b.displayName || b.resourceType}</span>
+                <span>${used}/${limit} (${pct}%)${resetTimeStr ? ' 重置:'+resetTimeStr : ''}</span>
+              </div>
+              <div style="background:var(--border);border-radius:4px;height:6px;margin-top:4px;">
+                <div style="background:${barColor};height:100%;border-radius:4px;width:${pct}%;"></div>
+              </div>
+            </div>`;
+            // 显示赠送积分(bonuses)
+            if (b.bonuses && b.bonuses.length > 0) {
+              for (const bonus of b.bonuses) {
+                const bUsed = bonus.currentUsage ?? 0;
+                const bLimit = bonus.usageLimit ?? 0;
+                const bPct = bLimit > 0 ? Math.round(bUsed / bLimit * 100) : 0;
+                const bColor = bPct > 80 ? 'var(--danger)' : bPct > 50 ? 'var(--warn)' : 'var(--ok)';
+                let expireStr = '';
+                if (bonus.expiresAt) {
+                  const expDate = new Date(bonus.expiresAt * 1000);
+                  expireStr = expDate.toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+                }
+                html += `<div style="margin-top:6px;margin-left:12px;padding:6px;background:rgba(99,102,241,0.1);border-radius:6px;">
+                  <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--accent);">
+                    <span>🎁 ${bonus.displayName || bonus.bonusCode || '赠送'}</span>
+                    <span>${bUsed}/${bLimit}${expireStr ? ' 过期:'+expireStr : ''}</span>
+                  </div>
+                  <div style="background:var(--border);border-radius:3px;height:4px;margin-top:3px;">
+                    <div style="background:${bColor};height:100%;border-radius:3px;width:${bPct}%;"></div>
+                  </div>
+                </div>`;
+              }
+            }
+            // 显示免费试用
+            if (b.freeTrialInfo && b.freeTrialInfo.usageLimit > 0) {
+              const ft = b.freeTrialInfo;
+              const ftUsed = ft.currentUsageWithPrecision ?? ft.currentUsage ?? 0;
+              const ftLimit = ft.usageLimitWithPrecision ?? ft.usageLimit ?? 0;
+              const ftPct = ftLimit > 0 ? Math.round(ftUsed / ftLimit * 100) : 0;
+              const ftColor = ftPct > 80 ? 'var(--danger)' : ftPct > 50 ? 'var(--warn)' : 'var(--ok)';
+              let ftExpire = '';
+              if (ft.freeTrialExpiry) {
+                const ftDate = new Date(ft.freeTrialExpiry * 1000);
+                ftExpire = ftDate.toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+              }
+              html += `<div style="margin-top:8px;">
+                <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text);">
+                  <span>🆓 免费试用 (${ft.freeTrialStatus || ''})</span>
+                  <span>${ftUsed}/${ftLimit} (${ftPct}%)${ftExpire ? ' 过期:'+ftExpire : ''}</span>
+                </div>
+                <div style="background:var(--border);border-radius:4px;height:6px;margin-top:4px;">
+                  <div style="background:${ftColor};height:100%;border-radius:4px;width:${ftPct}%;"></div>
+                </div>
+              </div>`;
+            }
+          }
+        }
+      }
+      html += '</div>';
+    }
+  } else {
+    html += '<div style="color:var(--muted);">暂无数据</div>';
+  }
+
+  html += '</div>';
+  modal.innerHTML = html;
+  modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
+  document.body.appendChild(modal);
+  usageModal = modal;
 }
 
  // URL Login (Device Authorization)
