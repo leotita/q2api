@@ -204,7 +204,7 @@
         <h2>账号管理 <span id="accountCount" style="font-size: 0.8em; color: #666;"></span></h2>
         <div class="row">
           <button class="btn-secondary" onclick="loadAccounts()">刷新列表</button>
-          <button class="btn-secondary" onclick="queryUsage()" id="usageBtn">查询使用量</button>
+          <button class="btn-secondary" onclick="queryUsage()" id="usageBtn">查询启用总使用量</button>
           <div style="margin-left: 20px;">
             <label><input type="radio" name="accountFilter" value="all" checked onchange="loadAccounts()"> 全部</label>
             <label style="margin-left: 10px;"><input type="radio" name="accountFilter" value="enabled" onchange="loadAccounts()"> 已启用</label>
@@ -405,6 +405,11 @@ function createAccountCard(acc) {
   toggle.appendChild(chk); toggle.appendChild(slider);
   toggleWrap.appendChild(toggleLabel); toggleWrap.appendChild(toggle);
 
+  const usageBtn = document.createElement('button');
+  usageBtn.className = 'btn-secondary';
+  usageBtn.textContent = '查询用量';
+  usageBtn.onclick = () => querySingleUsage(acc.id, acc.label);
+
   const refreshBtn = document.createElement('button');
   refreshBtn.className = 'btn-warn';
   refreshBtn.textContent = '刷新Token';
@@ -419,6 +424,7 @@ function createAccountCard(acc) {
   header.appendChild(id);
   header.appendChild(spacer);
   header.appendChild(toggleWrap);
+  header.appendChild(usageBtn);
   header.appendChild(refreshBtn);
   header.appendChild(delBtn);
   card.appendChild(header);
@@ -734,6 +740,24 @@ async function refreshAccount(id){
 
 // 使用量查询
 let usageModal = null;
+
+// 单个账号使用量查询
+async function querySingleUsage(accountId, label) {
+  try {
+    const r = await authFetch(api('/v2/accounts/' + encodeURIComponent(accountId) + '/usage'));
+    if (!r.ok) { throw new Error(await r.text()); }
+    const data = await r.json();
+    // 包装成与批量查询相同的格式
+    showUsageModal({
+      results: [data],
+      total: 1,
+      success_count: data.success ? 1 : 0
+    });
+  } catch(e) {
+    alert('查询使用量失败：' + e);
+  }
+}
+
 async function queryUsage(){
   const btn = document.getElementById('usageBtn');
   btn.disabled = true;
@@ -747,7 +771,7 @@ async function queryUsage(){
     alert('查询使用量失败：' + e);
   } finally {
     btn.disabled = false;
-    btn.textContent = '查询使用量';
+    btn.textContent = '查询启用总使用量';
   }
 }
 
@@ -757,12 +781,72 @@ function showUsageModal(data) {
   const modal = document.createElement('div');
   modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:1000;display:flex;align-items:center;justify-content:center;';
 
+  // 计算汇总统计
+  let totalCreditUsed = 0, totalCreditLimit = 0;
+  let totalFreeTrialUsed = 0, totalFreeTrialLimit = 0;
+  let hasMultipleAccounts = data.total > 1;
+
+  if (data.results && data.results.length > 0) {
+    for (const r of data.results) {
+      if (r.success && r.usage && r.usage.usageBreakdownList) {
+        for (const b of r.usage.usageBreakdownList) {
+          // 汇总 Credit 使用量
+          const used = b.currentUsageWithPrecision ?? b.currentUsage ?? 0;
+          const limit = b.usageLimitWithPrecision ?? b.usageLimit ?? 0;
+          totalCreditUsed += used;
+          totalCreditLimit += limit;
+          // 汇总免费试用
+          if (b.freeTrialInfo && b.freeTrialInfo.usageLimit > 0) {
+            const ft = b.freeTrialInfo;
+            const ftUsed = ft.currentUsageWithPrecision ?? ft.currentUsage ?? 0;
+            const ftLimit = ft.usageLimitWithPrecision ?? ft.usageLimit ?? 0;
+            totalFreeTrialUsed += ftUsed;
+            totalFreeTrialLimit += ftLimit;
+          }
+        }
+      }
+    }
+  }
+
+  const totalCreditPct = totalCreditLimit > 0 ? Math.round(totalCreditUsed / totalCreditLimit * 100) : 0;
+  const totalCreditColor = totalCreditPct > 80 ? 'var(--danger)' : totalCreditPct > 50 ? 'var(--warn)' : 'var(--ok)';
+  const totalFreeTrialPct = totalFreeTrialLimit > 0 ? Math.round(totalFreeTrialUsed / totalFreeTrialLimit * 100) : 0;
+  const totalFreeTrialColor = totalFreeTrialPct > 80 ? 'var(--danger)' : totalFreeTrialPct > 50 ? 'var(--warn)' : 'var(--ok)';
+
   let html = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;max-width:800px;max-height:80vh;overflow:auto;min-width:400px;">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
       <h2 style="margin:0;color:#c5d4ff;">使用量查询结果</h2>
       <button onclick="if(usageModal){usageModal.remove();usageModal=null;}" style="background:transparent;border:none;color:var(--muted);font-size:24px;cursor:pointer;">&times;</button>
     </div>
     <div style="color:var(--muted);margin-bottom:16px;">成功: ${data.success_count}/${data.total}</div>`;
+
+  // 显示汇总统计（仅当有多个账号时显示）
+  if (hasMultipleAccounts && totalCreditLimit > 0) {
+    html += `<div style="border:2px solid var(--accent);border-radius:12px;padding:16px;margin-bottom:20px;background:rgba(79,143,255,0.1);">
+      <h3 style="margin:0 0 12px 0;color:var(--accent);font-size:16px;">启用账号总使用量汇总</h3>
+      <div style="margin-bottom:12px;">
+        <div style="display:flex;justify-content:space-between;font-size:13px;color:var(--text);margin-bottom:4px;">
+          <span>Credit 总使用量</span>
+          <span>${totalCreditUsed.toFixed(2)}/${totalCreditLimit.toFixed(2)} (${totalCreditPct}%)</span>
+        </div>
+        <div style="background:var(--border);border-radius:6px;height:10px;">
+          <div style="background:${totalCreditColor};height:100%;border-radius:6px;width:${totalCreditPct}%;transition:width 0.3s;"></div>
+        </div>
+      </div>`;
+
+    if (totalFreeTrialLimit > 0) {
+      html += `<div>
+        <div style="display:flex;justify-content:space-between;font-size:13px;color:var(--text);margin-bottom:4px;">
+          <span>免费试用总使用量</span>
+          <span>${totalFreeTrialUsed.toFixed(2)}/${totalFreeTrialLimit.toFixed(2)} (${totalFreeTrialPct}%)</span>
+        </div>
+        <div style="background:var(--border);border-radius:6px;height:10px;">
+          <div style="background:${totalFreeTrialColor};height:100%;border-radius:6px;width:${totalFreeTrialPct}%;transition:width 0.3s;"></div>
+        </div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
 
   if (data.results && data.results.length > 0) {
     for (const r of data.results) {

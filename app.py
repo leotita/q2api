@@ -1329,6 +1329,14 @@ if CONSOLE_ENABLED:
         success_count = sum(1 for r in results if r["success"])
         return {"results": results, "total": len(results), "success_count": success_count}
 
+    @app.get("/v2/accounts/{account_id}/usage")
+    async def get_single_account_usage(account_id: str, _: bool = Depends(verify_admin_password)):
+        """查询单个账号的使用量"""
+        account = await get_account(account_id)
+        async with httpx.AsyncClient() as client:
+            result = await _get_account_usage(account, client)
+        return result
+
     @app.get("/v2/accounts/{account_id}")
     async def get_account_detail(account_id: str, _: bool = Depends(verify_admin_password)):
         return await get_account(account_id)
