@@ -258,7 +258,7 @@ def merge_user_messages(messages: List[Dict[str, Any]], hint: str = THINKING_HIN
     result = {
         "content": merged_content,
         "userInputMessageContext": base_context or {},
-        "origin": base_origin or "KIRO_CLI",
+        "origin": base_origin or "AI_EDITOR",
         "modelId": base_model
     }
     
@@ -276,17 +276,23 @@ def merge_user_messages(messages: List[Dict[str, Any]], hint: str = THINKING_HIN
     
     return result
 
-def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = False, hint: str = THINKING_HINT) -> List[Dict[str, Any]]:
+def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = False, hint: str = THINKING_HINT, system_prompt: str = "", model_id: str = "") -> List[Dict[str, Any]]:
     """Process history messages to match Amazon Q format (alternating user/assistant).
-    
+
+    关键修复：system prompt 处理方式与 JS 实现保持一致
+    参考 AIClient-2-API-main 的实现（claude-kiro.js 第 634-657 行）：
+    - 如果第一条消息是 user，将 system prompt 添加到第一条 user 消息的 content 前面
+    - 如果第一条消息不是 user，将 system prompt 作为独立的 user 消息添加到 history 开头
+
     Dual-mode detection:
     - If messages already alternate correctly (no consecutive user/assistant), skip merging
     - If messages have consecutive same-role messages, apply merge logic
     """
     history = []
     seen_tool_use_ids = set()
-    
+
     raw_history = []
+    start_index = 0  # 用于跟踪从哪个消息开始处理（如果 system prompt 已合并到第一条消息）
     
     # First pass: convert individual messages
     for msg in messages:
@@ -334,7 +340,7 @@ def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = Fals
             u_msg = {
                 "content": text_content,
                 "userInputMessageContext": user_ctx,
-                "origin": "KIRO_CLI"
+                "origin": "AI_EDITOR"
             }
             if images:
                 u_msg["images"] = images
@@ -368,6 +374,49 @@ def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = Fals
                     entry["assistantResponseMessage"]["toolUses"] = tool_uses
             
             raw_history.append(entry)
+
+    # 关键修复：system prompt 处理
+    # 参考 AIClient-2-API-main 的实现（claude-kiro.js 第 634-657 行）
+    final_history = []
+    start_index = 0
+
+    if system_prompt and raw_history:
+        first_item = raw_history[0]
+        if "userInputMessage" in first_item:
+            # 如果第一条消息是 user，将 system prompt 添加到第一条 user 消息的 content 前面
+            first_user_content = first_item["userInputMessage"].get("content", "")
+            final_history.append({
+                "userInputMessage": {
+                    "content": f"{system_prompt}\n\n{first_user_content}",
+                    "modelId": model_id,
+                    "origin": "AI_EDITOR"
+                }
+            })
+            start_index = 1  # 从第二条消息开始处理
+        else:
+            # 如果第一条消息不是 user，将 system prompt 作为独立的 user 消息添加到 history 开头
+            final_history.append({
+                "userInputMessage": {
+                    "content": system_prompt,
+                    "modelId": model_id,
+                    "origin": "AI_EDITOR"
+                }
+            })
+    elif system_prompt:
+        # 如果没有 history 但有 system prompt，添加为独立的 user 消息
+        final_history.append({
+            "userInputMessage": {
+                "content": system_prompt,
+                "modelId": model_id,
+                "origin": "AI_EDITOR"
+            }
+        })
+
+    # 添加剩余的 history 消息
+    for i in range(start_index, len(raw_history)):
+        final_history.append(raw_history[i])
+
+    raw_history = final_history
 
     # Dual-mode detection: check if messages already alternate correctly
     has_consecutive_same_role = False
@@ -495,6 +544,19 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
     if loop_error:
         raise ValueError(loop_error)
 
+    # 关键修复：移除最后一条 assistant 消息如果内容只是 "{"
+    # 参考 AIClient-2-API-main 的实现（claude-kiro.js 第 571-576 行）
+    messages = list(req.messages)  # 创建副本以便修改
+    if messages:
+        last_msg = messages[-1]
+        if last_msg.role == "assistant":
+            content = last_msg.content
+            if isinstance(content, list) and len(content) > 0:
+                first_block = content[0]
+                if isinstance(first_block, dict) and first_block.get("type") == "text" and first_block.get("text") == "{":
+                    logger.info('[Kiro] Removing last assistant with "{" message from messages')
+                    messages.pop()
+
     thinking_enabled = is_thinking_mode_enabled(getattr(req, "thinking", None))
         
     # 1. Tools
@@ -506,11 +568,36 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
                 long_desc_tools.append({"name": t.name, "full_description": t.description})
             aq_tools.append(convert_tool(t))
             
+    # 关键修复：合并相邻的同角色消息
+    # 参考 AIClient-2-API-main 的实现（claude-kiro.js 第 578-613 行）
+    merged_messages = []
+    for msg in messages:
+        if not merged_messages:
+            merged_messages.append(msg)
+        else:
+            last_merged = merged_messages[-1]
+            if msg.role == last_merged.role:
+                # 合并消息内容
+                last_content = last_merged.content
+                curr_content = msg.content
+                if isinstance(last_content, list) and isinstance(curr_content, list):
+                    last_merged.content = last_content + curr_content
+                elif isinstance(last_content, str) and isinstance(curr_content, str):
+                    last_merged.content = last_content + "\n" + curr_content
+                elif isinstance(last_content, list) and isinstance(curr_content, str):
+                    last_merged.content = last_content + [{"type": "text", "text": curr_content}]
+                elif isinstance(last_content, str) and isinstance(curr_content, list):
+                    last_merged.content = [{"type": "text", "text": last_content}] + curr_content
+                logger.info(f"[Kiro] Merged adjacent {msg.role} messages")
+            else:
+                merged_messages.append(msg)
+    messages = merged_messages
+
     # 2. Current Message (last user message)
     # 关键修复：处理最后一条消息是 assistant 的情况
     # 参考 AIClient-2-API-main 的实现：如果最后一条消息是 assistant，
     # 需要将其移入 history 并创建一个 "Continue" 的 user 消息
-    last_msg = req.messages[-1] if req.messages else None
+    last_msg = messages[-1] if messages else None
     prompt_content = ""
     tool_results = None
     has_tool_result = False
@@ -557,36 +644,18 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
         user_ctx["toolResults"] = tool_results
         
     # 4. Format Content
-    # 关键修复：当有 tool_result 但没有文本时，content 不能为空
-    # 参考 AIClient-2-API-main 的实现：确保 content 永远不为空
-    # 关键修复：当最后一条消息是 assistant 时，创建 "Continue" user 消息
+    # 关键修复：简化 content 格式，与 JS 实现保持一致
+    # 参考 AIClient-2-API-main 的实现：使用简单字符串，不使用结构化块
     if last_msg_is_assistant:
         formatted_content = "Continue"
     elif has_tool_result and not prompt_content:
         formatted_content = "Tool results provided."
     else:
-        formatted_content = (
-            "--- CONTEXT ENTRY BEGIN ---\n"
-            f"Current time: {get_current_timestamp()}\n"
-            "--- CONTEXT ENTRY END ---\n\n"
-            "--- USER MESSAGE BEGIN ---\n"
-            f"{prompt_content}\n"
-            "--- USER MESSAGE END ---"
-        )
-        
-    if long_desc_tools:
-        docs = []
-        for info in long_desc_tools:
-            docs.append(f"Tool: {info['name']}\nFull Description:\n{info['full_description']}\n")
-        formatted_content = (
-            "--- TOOL DOCUMENTATION BEGIN ---\n"
-            f"{''.join(docs)}"
-            "--- TOOL DOCUMENTATION END ---\n\n"
-            f"{formatted_content}"
-        )
-        
-    if req.system and formatted_content:
-        sys_text = ""
+        formatted_content = prompt_content
+
+    # 提取 system prompt 文本（用于 history 处理）
+    sys_text = ""
+    if req.system:
         if isinstance(req.system, str):
             sys_text = req.system
         elif isinstance(req.system, list):
@@ -595,14 +664,6 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
                 if isinstance(b, dict) and b.get("type") == "text":
                     parts.append(b.get("text", ""))
             sys_text = "\n".join(parts)
-            
-        if sys_text:
-            formatted_content = (
-                "--- SYSTEM PROMPT BEGIN ---\n"
-                f"{sys_text}\n"
-                "--- SYSTEM PROMPT END ---\n\n"
-                f"{formatted_content}"
-            )
 
     # Append thinking hint at the very end, outside all structured blocks
     if thinking_enabled:
@@ -615,7 +676,7 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
     user_input_msg = {
         "content": formatted_content,
         "userInputMessageContext": user_ctx,
-        "origin": "KIRO_CLI",
+        "origin": "AI_EDITOR",
         "modelId": model_id
     }
     if images:
@@ -625,10 +686,10 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
     # 关键修复：当最后一条消息是 assistant 时，将所有消息都移入 history
     # 参考 AIClient-2-API-main 的实现（claude-kiro.js 第 750-781 行）
     if last_msg_is_assistant:
-        history_msgs = req.messages  # 包括最后一条 assistant 消息
+        history_msgs = messages  # 包括最后一条 assistant 消息
     else:
-        history_msgs = req.messages[:-1] if len(req.messages) > 1 else []
-    aq_history = process_history(history_msgs, thinking_enabled=thinking_enabled, hint=THINKING_HINT)
+        history_msgs = messages[:-1] if len(messages) > 1 else []
+    aq_history = process_history(history_msgs, thinking_enabled=thinking_enabled, hint=THINKING_HINT, system_prompt=sys_text, model_id=model_id)
 
     # Validate history alternation to prevent infinite loops
     _validate_history_alternation(aq_history)
