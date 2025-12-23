@@ -296,4 +296,9 @@ class ClaudeStreamHandler:
         # output_tokens = max(1, (len(full_text) + len(full_tool_input)) // 4)
         output_tokens = count_tokens(full_text) + count_tokens(full_tool_input)
 
-        yield build_message_stop(self.input_tokens, output_tokens, "end_turn")
+        # 关键修复：根据是否有 tool_use 返回正确的 stop_reason
+        # 参考 AIClient-2-API-main 的实现（claude-kiro.js 第 1499-1503 行）
+        # 当有工具调用时，stop_reason 应该是 "tool_use" 而不是 "end_turn"
+        # 这样 Claude Code 才知道需要等待工具执行结果，而不是认为对话已结束
+        stop_reason = "tool_use" if self._processed_tool_use_ids else "end_turn"
+        yield build_message_stop(self.input_tokens, output_tokens, stop_reason)
