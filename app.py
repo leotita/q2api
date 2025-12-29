@@ -577,12 +577,39 @@ async def claude_messages(
     Claude-compatible messages endpoint.
     """
     # 1. Convert request
-    requested_conversation_id = req.conversation_id or x_conversation_id
+    # Always generate a new conversation_id like amq2api does
+    # Using the same conversation_id can cause Amazon Q to return cached/stale data
     try:
-        aq_request = convert_claude_to_amazonq_request(req, conversation_id=requested_conversation_id)
+        aq_request = convert_claude_to_amazonq_request(req, conversation_id=None)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=f"Request conversion failed: {str(e)}")
+
+    # Post-process history to fix message ordering (prevents infinite loops)
+    from message_processor import process_claude_history_for_amazonq
+    conversation_state = aq_request.get("conversationState", {})
+    history = conversation_state.get("history", [])
+    if history:
+        processed_history = process_claude_history_for_amazonq(history)
+        aq_request["conversationState"]["history"] = processed_history
+
+    # Remove duplicate tail userInputMessage that matches currentMessage content
+    # This prevents the model from repeatedly responding to the same user message
+    conversation_state = aq_request.get("conversationState", {})
+    current_msg = conversation_state.get("currentMessage", {}).get("userInputMessage", {})
+    current_content = (current_msg.get("content") or "").strip()
+    history = conversation_state.get("history", [])
+
+    if history and current_content:
+        last = history[-1]
+        if "userInputMessage" in last:
+            last_content = (last["userInputMessage"].get("content") or "").strip()
+            if last_content and last_content == current_content:
+                # Remove duplicate tail userInputMessage
+                history = history[:-1]
+                aq_request["conversationState"]["history"] = history
+                import logging
+                logging.getLogger(__name__).info("Removed duplicate tail userInputMessage to prevent repeated response")
 
     conversation_state = aq_request.get("conversationState", {})
     conversation_id = conversation_state.get("conversationId")
@@ -597,7 +624,7 @@ async def claude_messages(
         if not access:
             refreshed = await refresh_access_token_in_db(account["id"])
             access = refreshed.get("accessToken")
-        
+
         # We call with stream=True to get the event iterator
         _, _, tracker, event_iter = await send_chat_request(
             access_token=access,
@@ -607,7 +634,7 @@ async def claude_messages(
             client=GLOBAL_CLIENT,
             raw_payload=aq_request
         )
-        
+
         if not event_iter:
              raise HTTPException(status_code=502, detail="No event stream returned")
 
@@ -621,7 +648,7 @@ async def claude_messages(
                 for item in req.system:
                     if isinstance(item, dict) and item.get("type") == "text":
                         text_to_count += item.get("text", "")
-        
+
         for msg in req.messages:
             if isinstance(msg.content, str):
                 text_to_count += msg.content
@@ -631,7 +658,7 @@ async def claude_messages(
                         text_to_count += item.get("text", "")
 
         input_tokens = count_tokens(text_to_count, apply_multiplier=True)
-        handler = ClaudeStreamHandler(model=req.model, input_tokens=input_tokens)
+        handler = ClaudeStreamHandler(model=req.model, input_tokens=input_tokens, conversation_id=conversation_id)
 
         # Try to get the first event to ensure the connection is valid
         # This allows us to return proper HTTP error codes before starting the stream
@@ -651,7 +678,7 @@ async def claude_messages(
                     event_type, payload = first_event
                     async for sse in handler.handle_event(event_type, payload):
                         yield sse
-                
+
                 # Process remaining events
                 async for event_type, payload in event_iter:
                     async for sse in handler.handle_event(event_type, payload):
@@ -677,19 +704,19 @@ async def claude_messages(
             # This is a bit complex because we need to reconstruct the full response object
             # For now, let's just support streaming as it's the main use case for Claude Code
             # But to be nice, let's try to support non-streaming by consuming the generator
-            
+
             content_blocks = []
             usage = {"input_tokens": 0, "output_tokens": 0}
             stop_reason = None
-            
+
             # We need to parse the SSE strings back to objects... inefficient but works
             # Or we could refactor handler to yield objects.
             # For now, let's just raise error for non-streaming or implement basic text
             # Claude Code uses streaming.
-            
+
             # Let's implement a basic accumulator from the SSE stream
             final_content = []
-            
+
             async for sse_chunk in event_generator():
                 data_str = None
                 # Each chunk from the generator can have multiple lines ('event:', 'data:').
@@ -698,20 +725,20 @@ async def claude_messages(
                     if line.startswith("data:"):
                         data_str = line[6:].strip()
                         break
-                
+
                 if not data_str or data_str == "[DONE]":
                     continue
-                
+
                 try:
                     data = json.loads(data_str)
                     dtype = data.get("type")
-                    
+
                     if dtype == "content_block_start":
                         idx = data.get("index", 0)
                         while len(final_content) <= idx:
                             final_content.append(None)
                         final_content[idx] = data.get("content_block")
-                    
+
                     elif dtype == "content_block_delta":
                         idx = data.get("index", 0)
                         delta = data.get("delta", {})
@@ -725,7 +752,7 @@ async def claude_messages(
                                 if "partial_json" not in final_content[idx]:
                                     final_content[idx]["partial_json"] = ""
                                 final_content[idx]["partial_json"] += delta.get("partial_json", "")
-                    
+
                     elif dtype == "content_block_stop":
                         idx = data.get("index", 0)
                         if final_content[idx] and final_content[idx].get("type") == "tool_use":
@@ -736,11 +763,11 @@ async def claude_messages(
                                     # Keep partial if invalid
                                     final_content[idx]["input"] = {"error": "invalid json", "partial": final_content[idx]["partial_json"]}
                                 del final_content[idx]["partial_json"]
-                    
+
                     elif dtype == "message_delta":
                         usage = data.get("usage", usage)
                         stop_reason = data.get("delta", {}).get("stop_reason")
-                
+
                 except json.JSONDecodeError:
                     # Ignore lines that are not valid JSON
                     pass
