@@ -730,7 +730,7 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
     aq_history = process_history(history_msgs, thinking_enabled=thinking_enabled, hint=THINKING_HINT)
 
     # Validate history alternation to prevent infinite loops
-    _validate_history_alternation(aq_history)
+    # _validate_history_alternation(aq_history)  # Disabled: validation moved to message_processor.py
 
     # 8. Final Body
     return {
