@@ -650,7 +650,7 @@ async def claude_messages(
                     text_to_count += item.get("text", "")
     input_tokens = count_tokens(text_to_count, apply_multiplier=True)
 
-    # Retry loop
+    # Retry loop with exponential backoff
     tried_account_ids: List[str] = []
     last_error: Optional[Exception] = None
     max_attempts = MAX_RETRY_COUNT + 1  # +1 for initial attempt
@@ -660,7 +660,16 @@ async def claude_messages(
         account = None
         try:
             # Get account (excluding previously failed ones)
-            account = await resolve_account_for_key(bearer_key, exclude_ids=tried_account_ids if tried_account_ids else None)
+            # If no accounts available, reset the exclusion list and try again
+            try:
+                account = await resolve_account_for_key(bearer_key, exclude_ids=tried_account_ids if tried_account_ids else None)
+            except HTTPException as he:
+                if "No enabled account available" in str(he.detail) and tried_account_ids:
+                    # All accounts tried, reset and try again
+                    tried_account_ids = []
+                    account = await resolve_account_for_key(bearer_key, exclude_ids=None)
+                else:
+                    raise
             tried_account_ids.append(account["id"])
 
             access = account.get("accessToken")
@@ -805,10 +814,14 @@ async def claude_messages(
                 await _update_stats(account["id"], False)
             last_error = e
 
-            # Log retry attempt
+            # Log retry attempt and apply exponential backoff
             if attempt < max_attempts - 1:
                 import logging
-                logging.getLogger(__name__).warning(f"Request failed (attempt {attempt + 1}/{max_attempts}), retrying with different account: {str(e)}")
+                import asyncio
+                # Exponential backoff: 3s, 6s, 12s, 24s... max 30s
+                wait_time = min(3 * (2 ** attempt), 30)
+                logging.getLogger(__name__).warning(f"Request failed (attempt {attempt + 1}/{max_attempts}), retrying in {wait_time}s with different account: {str(e)}")
+                await asyncio.sleep(wait_time)
                 continue
             else:
                 # All retries exhausted
