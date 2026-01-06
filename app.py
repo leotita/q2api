@@ -345,7 +345,7 @@ async def resolve_account_for_key(bearer_key: Optional[str]) -> Dict[str, Any]:
         if not bearer_key or bearer_key not in ALLOWED_API_KEYS:
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-    # Selection: random among enabled accounts
+    # Selection: prefer accounts with lowest error rate, random among ties
     if LAZY_ACCOUNT_POOL_ENABLED:
         candidates = await _list_enabled_accounts(limit=LAZY_ACCOUNT_POOL_SIZE)
     else:
@@ -353,7 +353,17 @@ async def resolve_account_for_key(bearer_key: Optional[str]) -> Dict[str, Any]:
 
     if not candidates:
         raise HTTPException(status_code=401, detail="No enabled account available")
-    return random.choice(candidates)
+
+    # Calculate error rate for each account
+    def get_error_rate(acc):
+        total = acc.get("success_count", 0) + acc.get("error_count", 0)
+        return acc.get("error_count", 0) / total if total > 0 else 0.0
+
+    # Find minimum error rate and filter candidates
+    min_rate = min(get_error_rate(acc) for acc in candidates)
+    best_candidates = [acc for acc in candidates if get_error_rate(acc) == min_rate]
+
+    return random.choice(best_candidates)
 
 # ------------------------------------------------------------------------------
 # Pydantic Schemas
