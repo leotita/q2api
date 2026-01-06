@@ -582,6 +582,51 @@ def _openai_non_streaming_response(
 def _sse_format(obj: Dict[str, Any]) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
+# ------------------------------------------------------------------------------
+# Claude API: Models endpoint
+# ------------------------------------------------------------------------------
+
+@app.get("/v1/models")
+async def get_models():
+    """
+    获取可用模型列表，兼容 Claude API 格式。
+    Claude Code CLI 需要此接口获取模型的 max_tokens 信息用于自动压缩。
+    """
+    models = [
+        {
+            "id": "claude-sonnet-4-5-20250929",
+            "object": "model",
+            "created": 1727568000,
+            "owned_by": "anthropic",
+            "display_name": "Claude Sonnet 4.5",
+            "type": "chat",
+            "max_tokens": 32000,
+        },
+        {
+            "id": "claude-opus-4-5-20251101",
+            "object": "model",
+            "created": 1730419200,
+            "owned_by": "anthropic",
+            "display_name": "Claude Opus 4.5",
+            "type": "chat",
+            "max_tokens": 32000,
+        },
+        {
+            "id": "claude-haiku-4-5-20251001",
+            "object": "model",
+            "created": 1727740800,
+            "owned_by": "anthropic",
+            "display_name": "Claude Haiku 4.5",
+            "type": "chat",
+            "max_tokens": 32000,
+        },
+    ]
+    return {"object": "list", "data": models}
+
+# ------------------------------------------------------------------------------
+# Claude API: Messages endpoint
+# ------------------------------------------------------------------------------
+
 @app.post("/v1/messages")
 async def claude_messages(
     req: ClaudeRequest,
@@ -705,14 +750,40 @@ async def claude_messages(
             current_tracker = tracker
 
             async def event_generator():
+                """SSE 事件生成器，带 ping 保活机制（每25秒发送一次）"""
+                PING_INTERVAL = 25  # 秒
+                ping_sse = "event: ping\ndata: {\"type\": \"ping\"}\n\n"
+
+                async def ping_with_timeout(event_aiter, timeout):
+                    """带超时的事件获取，超时时返回 None 表示需要发送 ping"""
+                    try:
+                        return await asyncio.wait_for(event_aiter.__anext__(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        return None
+                    except StopAsyncIteration:
+                        raise
+
                 try:
+                    # 处理第一个事件
                     if first_event:
                         event_type, payload = first_event
                         async for sse in handler.handle_event(event_type, payload):
                             yield sse
-                    async for event_type, payload in event_iter:
-                        async for sse in handler.handle_event(event_type, payload):
-                            yield sse
+
+                    # 处理后续事件，带 ping 保活
+                    while True:
+                        try:
+                            result = await ping_with_timeout(event_iter, PING_INTERVAL)
+                            if result is None:
+                                # 超时，发送 ping 保活
+                                yield ping_sse
+                                continue
+                            event_type, payload = result
+                            async for sse in handler.handle_event(event_type, payload):
+                                yield sse
+                        except StopAsyncIteration:
+                            break
+
                     async for sse in handler.finish():
                         yield sse
                     await _update_stats(current_account["id"], True)
