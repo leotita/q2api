@@ -359,9 +359,10 @@ async def resolve_account_for_key(bearer_key: Optional[str]) -> Dict[str, Any]:
         total = acc.get("success_count", 0) + acc.get("error_count", 0)
         return acc.get("error_count", 0) / total if total > 0 else 0.0
 
-    # Find minimum error rate and filter candidates
-    min_rate = min(get_error_rate(acc) for acc in candidates)
-    best_candidates = [acc for acc in candidates if get_error_rate(acc) == min_rate]
+    # Sort by error rate and take top ceil(n/2) accounts
+    sorted_candidates = sorted(candidates, key=get_error_rate)
+    pool_size = (len(sorted_candidates) + 1) // 2  # ceil(n/2): 2→1, 3→2, 5→3
+    best_candidates = sorted_candidates[:pool_size]
 
     return random.choice(best_candidates)
 
