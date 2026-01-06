@@ -750,41 +750,14 @@ async def claude_messages(
             current_tracker = tracker
 
             async def event_generator():
-                """SSE 事件生成器，带 ping 保活机制（每25秒发送一次）"""
-                import asyncio as _asyncio  # 显式导入避免闭包作用域问题
-                PING_INTERVAL = 25  # 秒
-                ping_sse = "event: ping\ndata: {\"type\": \"ping\"}\n\n"
-
-                async def ping_with_timeout(event_aiter, timeout):
-                    """带超时的事件获取，超时时返回 None 表示需要发送 ping"""
-                    try:
-                        return await _asyncio.wait_for(event_aiter.__anext__(), timeout=timeout)
-                    except _asyncio.TimeoutError:
-                        return None
-                    except StopAsyncIteration:
-                        raise
-
                 try:
-                    # 处理第一个事件
                     if first_event:
                         event_type, payload = first_event
                         async for sse in handler.handle_event(event_type, payload):
                             yield sse
-
-                    # 处理后续事件，带 ping 保活
-                    while True:
-                        try:
-                            result = await ping_with_timeout(event_iter, PING_INTERVAL)
-                            if result is None:
-                                # 超时，发送 ping 保活
-                                yield ping_sse
-                                continue
-                            event_type, payload = result
-                            async for sse in handler.handle_event(event_type, payload):
-                                yield sse
-                        except StopAsyncIteration:
-                            break
-
+                    async for event_type, payload in event_iter:
+                        async for sse in handler.handle_event(event_type, payload):
+                            yield sse
                     async for sse in handler.finish():
                         yield sse
                     await _update_stats(current_account["id"], True)
