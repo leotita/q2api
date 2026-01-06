@@ -21,6 +21,9 @@ except Exception:
 THINKING_START_TAG = "<thinking>"
 THINKING_END_TAG = "</thinking>"
 
+# 上下文窗口大小（200k tokens）
+CONTEXT_WINDOW_SIZE = 200_000
+
 def _pending_tag_suffix(buffer: str, tag: str) -> int:
     """Length of the suffix of buffer that matches the prefix of tag (for partial matches)."""
     if not buffer or not tag:
@@ -75,6 +78,7 @@ class ClaudeStreamHandler:
     def __init__(self, model: str, input_tokens: int = 0, conversation_id: Optional[str] = None):
         self.model = model
         self.input_tokens = input_tokens
+        self.context_input_tokens: Optional[int] = None  # 从 contextUsageEvent 计算的实际值
         self.response_buffer: List[str] = []
         self.content_block_index: int = -1
         self.content_block_started: bool = False
@@ -302,11 +306,25 @@ class ClaudeStreamHandler:
             # Mark as finished to prevent processing further events
             self.response_ended = True
 
+            # 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
+            final_input_tokens = self.context_input_tokens if self.context_input_tokens is not None else self.input_tokens
+
             # Immediately send message_stop (instead of waiting for finish())
             full_text = "".join(self.response_buffer)
             full_tool_input = "".join(self.all_tool_inputs)
             output_tokens = count_tokens(full_text) + count_tokens(full_tool_input)
-            yield build_message_stop(self.input_tokens, output_tokens, "end_turn")
+            stop_reason = "tool_use" if self._processed_tool_use_ids else "end_turn"
+            yield build_message_stop(final_input_tokens, output_tokens, stop_reason)
+
+        # 5. Context Usage Event (contextUsageEvent) - 用于获取实际的 input_tokens
+        elif event_type == "contextUsageEvent":
+            # 从上下文使用百分比计算实际的 input_tokens
+            # 公式: percentage * 200000 / 100
+            context_usage_percentage = payload.get("contextUsagePercentage", 0)
+            if context_usage_percentage > 0:
+                actual_input_tokens = int(context_usage_percentage * CONTEXT_WINDOW_SIZE / 100)
+                self.context_input_tokens = actual_input_tokens
+                logger.debug(f"收到 contextUsageEvent: {context_usage_percentage}%, 计算 input_tokens: {actual_input_tokens}")
 
     async def finish(self) -> AsyncGenerator[str, None]:
         """Send final events."""
@@ -348,9 +366,12 @@ class ClaudeStreamHandler:
         # output_tokens = max(1, (len(full_text) + len(full_tool_input)) // 4)
         output_tokens = count_tokens(full_text) + count_tokens(full_tool_input)
 
+        # 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
+        final_input_tokens = self.context_input_tokens if self.context_input_tokens is not None else self.input_tokens
+
         # 关键修复：根据是否有 tool_use 返回正确的 stop_reason
         # 参考 AIClient-2-API-main 的实现（claude-kiro.js 第 1499-1503 行）
         # 当有工具调用时，stop_reason 应该是 "tool_use" 而不是 "end_turn"
         # 这样 Claude Code 才知道需要等待工具执行结果，而不是认为对话已结束
         stop_reason = "tool_use" if self._processed_tool_use_ids else "end_turn"
-        yield build_message_stop(self.input_tokens, output_tokens, stop_reason)
+        yield build_message_stop(final_input_tokens, output_tokens, stop_reason)
