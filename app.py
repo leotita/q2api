@@ -258,6 +258,7 @@ def _parse_allowed_keys_env() -> List[str]:
 
 ALLOWED_API_KEYS: List[str] = _parse_allowed_keys_env()
 MAX_ERROR_COUNT: int = int(os.getenv("MAX_ERROR_COUNT", "100"))
+MAX_RETRY_COUNT: int = int(os.getenv("MAX_RETRY_COUNT", "3"))
 TOKEN_COUNT_MULTIPLIER: float = float(os.getenv("TOKEN_COUNT_MULTIPLIER", "1.0"))
 
 # Lazy Account Pool settings
@@ -334,7 +335,7 @@ async def verify_account(account: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
             return False, "AccessDenied"
         return False, None
 
-async def resolve_account_for_key(bearer_key: Optional[str]) -> Dict[str, Any]:
+async def resolve_account_for_key(bearer_key: Optional[str], exclude_ids: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     Authorize request by OPENAI_KEYS (if configured), then select an AWS account.
     Selection strategy: weighted random based on error rate (lower error rate = higher probability).
@@ -350,6 +351,10 @@ async def resolve_account_for_key(bearer_key: Optional[str]) -> Dict[str, Any]:
         candidates = await _list_enabled_accounts(limit=LAZY_ACCOUNT_POOL_SIZE)
     else:
         candidates = await _list_enabled_accounts()
+
+    # Exclude specified accounts (for retry)
+    if exclude_ids:
+        candidates = [acc for acc in candidates if acc.get("id") not in exclude_ids]
 
     if not candidates:
         raise HTTPException(status_code=401, detail="No enabled account available")
@@ -580,15 +585,17 @@ def _sse_format(obj: Dict[str, Any]) -> str:
 @app.post("/v1/messages")
 async def claude_messages(
     req: ClaudeRequest,
-    account: Dict[str, Any] = Depends(require_account),
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
     x_conversation_id: Optional[str] = Header(default=None, alias="x-conversation-id")
 ):
     """
-    Claude-compatible messages endpoint.
+    Claude-compatible messages endpoint with retry support.
     """
-    # 1. Convert request
-    # Always generate a new conversation_id like amq2api does
-    # Using the same conversation_id can cause Amazon Q to return cached/stale data
+    # Extract bearer key for authorization
+    bearer_key = _extract_bearer(authorization) if authorization else x_api_key
+
+    # 1. Convert request (do this once, before retry loop)
     try:
         aq_request = convert_claude_to_amazonq_request(req, conversation_id=None)
     except Exception as e:
@@ -604,7 +611,6 @@ async def claude_messages(
         aq_request["conversationState"]["history"] = processed_history
 
     # Remove duplicate tail userInputMessage that matches currentMessage content
-    # This prevents the model from repeatedly responding to the same user message
     conversation_state = aq_request.get("conversationState", {})
     current_msg = conversation_state.get("currentMessage", {}).get("userInputMessage", {})
     current_content = (current_msg.get("content") or "").strip()
@@ -615,7 +621,6 @@ async def claude_messages(
         if "userInputMessage" in last:
             last_content = (last["userInputMessage"].get("content") or "").strip()
             if last_content and last_content == current_content:
-                # Remove duplicate tail userInputMessage
                 history = history[:-1]
                 aq_request["conversationState"]["history"] = history
                 import logging
@@ -627,197 +632,187 @@ async def claude_messages(
     if conversation_id:
         response_headers["x-conversation-id"] = conversation_id
 
-    # Always stream from upstream to get full event details
-    event_iter = None
-    try:
-        access = account.get("accessToken")
-        if not access:
-            refreshed = await refresh_access_token_in_db(account["id"])
-            access = refreshed.get("accessToken")
+    # Calculate input tokens (do this once)
+    text_to_count = ""
+    if req.system:
+        if isinstance(req.system, str):
+            text_to_count += req.system
+        elif isinstance(req.system, list):
+            for item in req.system:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_to_count += item.get("text", "")
+    for msg in req.messages:
+        if isinstance(msg.content, str):
+            text_to_count += msg.content
+        elif isinstance(msg.content, list):
+            for item in msg.content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_to_count += item.get("text", "")
+    input_tokens = count_tokens(text_to_count, apply_multiplier=True)
 
-        # We call with stream=True to get the event iterator
-        _, _, tracker, event_iter = await send_chat_request(
-            access_token=access,
-            messages=[],
-            model=map_model_name(req.model),
-            stream=True,
-            client=GLOBAL_CLIENT,
-            raw_payload=aq_request
-        )
+    # Retry loop
+    tried_account_ids: List[str] = []
+    last_error: Optional[Exception] = None
+    max_attempts = MAX_RETRY_COUNT + 1  # +1 for initial attempt
 
-        if not event_iter:
-             raise HTTPException(status_code=502, detail="No event stream returned")
-
-        # Handler
-        # Calculate input tokens
-        text_to_count = ""
-        if req.system:
-            if isinstance(req.system, str):
-                text_to_count += req.system
-            elif isinstance(req.system, list):
-                for item in req.system:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        text_to_count += item.get("text", "")
-
-        for msg in req.messages:
-            if isinstance(msg.content, str):
-                text_to_count += msg.content
-            elif isinstance(msg.content, list):
-                for item in msg.content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        text_to_count += item.get("text", "")
-
-        input_tokens = count_tokens(text_to_count, apply_multiplier=True)
-        handler = ClaudeStreamHandler(model=req.model, input_tokens=input_tokens, conversation_id=conversation_id)
-
-        # Try to get the first event to ensure the connection is valid
-        # This allows us to return proper HTTP error codes before starting the stream
-        first_event = None
+    for attempt in range(max_attempts):
+        event_iter = None
+        account = None
         try:
-            first_event = await event_iter.__anext__()
-        except StopAsyncIteration:
-            raise HTTPException(status_code=502, detail="Empty response from upstream")
-        except Exception as e:
-            # If we get an error before the first event, we can still return proper status code
-            raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
+            # Get account (excluding previously failed ones)
+            account = await resolve_account_for_key(bearer_key, exclude_ids=tried_account_ids if tried_account_ids else None)
+            tried_account_ids.append(account["id"])
 
-        async def event_generator():
-            try:
-                # Process the first event we already fetched
-                if first_event:
-                    event_type, payload = first_event
-                    async for sse in handler.handle_event(event_type, payload):
-                        yield sse
+            access = account.get("accessToken")
+            if not access:
+                refreshed = await refresh_access_token_in_db(account["id"])
+                access = refreshed.get("accessToken")
 
-                # Process remaining events
-                async for event_type, payload in event_iter:
-                    async for sse in handler.handle_event(event_type, payload):
-                        yield sse
-                async for sse in handler.finish():
-                    yield sse
-                await _update_stats(account["id"], True)
-            except GeneratorExit:
-                # Client disconnected - update stats but don't re-raise
-                await _update_stats(account["id"], tracker.has_content if tracker else False)
-            except Exception:
-                await _update_stats(account["id"], False)
-                raise
-
-        if req.stream:
-            return StreamingResponse(
-                event_generator(),
-                media_type="text/event-stream",
-                headers=response_headers or None
+            # Send request
+            _, _, tracker, event_iter = await send_chat_request(
+                access_token=access,
+                messages=[],
+                model=map_model_name(req.model),
+                stream=True,
+                client=GLOBAL_CLIENT,
+                raw_payload=aq_request
             )
-        else:
-            # Accumulate for non-streaming
-            # This is a bit complex because we need to reconstruct the full response object
-            # For now, let's just support streaming as it's the main use case for Claude Code
-            # But to be nice, let's try to support non-streaming by consuming the generator
 
-            content_blocks = []
-            usage = {"input_tokens": 0, "output_tokens": 0}
-            stop_reason = None
+            if not event_iter:
+                raise Exception("No event stream returned")
 
-            # We need to parse the SSE strings back to objects... inefficient but works
-            # Or we could refactor handler to yield objects.
-            # For now, let's just raise error for non-streaming or implement basic text
-            # Claude Code uses streaming.
+            # Try to get the first event to ensure the connection is valid
+            first_event = None
+            try:
+                first_event = await event_iter.__anext__()
+            except StopAsyncIteration:
+                raise Exception("Empty response from upstream")
 
-            # Let's implement a basic accumulator from the SSE stream
-            final_content = []
+            # Success! Create handler and return response
+            handler = ClaudeStreamHandler(model=req.model, input_tokens=input_tokens, conversation_id=conversation_id)
 
-            async for sse_chunk in event_generator():
-                data_str = None
-                # Each chunk from the generator can have multiple lines ('event:', 'data:').
-                # We need to find the 'data:' line.
-                for line in sse_chunk.strip().split('\n'):
-                    if line.startswith("data:"):
-                        data_str = line[6:].strip()
-                        break
+            # Capture account for closure
+            current_account = account
+            current_tracker = tracker
 
-                if not data_str or data_str == "[DONE]":
-                    continue
-
+            async def event_generator():
                 try:
-                    data = json.loads(data_str)
-                    dtype = data.get("type")
-
-                    if dtype == "content_block_start":
-                        idx = data.get("index", 0)
-                        while len(final_content) <= idx:
-                            final_content.append(None)
-                        final_content[idx] = data.get("content_block")
-
-                    elif dtype == "content_block_delta":
-                        idx = data.get("index", 0)
-                        delta = data.get("delta", {})
-                        if final_content[idx]:
-                            if delta.get("type") == "text_delta":
-                                final_content[idx]["text"] += delta.get("text", "")
-                            elif delta.get("type") == "thinking_delta":
-                                final_content[idx].setdefault("thinking", "")
-                                final_content[idx]["thinking"] += delta.get("thinking", "")
-                            elif delta.get("type") == "input_json_delta":
-                                if "partial_json" not in final_content[idx]:
-                                    final_content[idx]["partial_json"] = ""
-                                final_content[idx]["partial_json"] += delta.get("partial_json", "")
-
-                    elif dtype == "content_block_stop":
-                        idx = data.get("index", 0)
-                        if final_content[idx] and final_content[idx].get("type") == "tool_use":
-                            if "partial_json" in final_content[idx]:
-                                try:
-                                    final_content[idx]["input"] = json.loads(final_content[idx]["partial_json"])
-                                except json.JSONDecodeError:
-                                    # Keep partial if invalid
-                                    final_content[idx]["input"] = {"error": "invalid json", "partial": final_content[idx]["partial_json"]}
-                                del final_content[idx]["partial_json"]
-
-                    elif dtype == "message_delta":
-                        usage = data.get("usage", usage)
-                        stop_reason = data.get("delta", {}).get("stop_reason")
-
-                except json.JSONDecodeError:
-                    # Ignore lines that are not valid JSON
-                    pass
+                    if first_event:
+                        event_type, payload = first_event
+                        async for sse in handler.handle_event(event_type, payload):
+                            yield sse
+                    async for event_type, payload in event_iter:
+                        async for sse in handler.handle_event(event_type, payload):
+                            yield sse
+                    async for sse in handler.finish():
+                        yield sse
+                    await _update_stats(current_account["id"], True)
+                except GeneratorExit:
+                    await _update_stats(current_account["id"], current_tracker.has_content if current_tracker else False)
                 except Exception:
-                    # Broad exception to prevent accumulator from crashing on one bad event
-                    traceback.print_exc()
-                    pass
+                    await _update_stats(current_account["id"], False)
+                    raise
 
-            # Final assembly
-            final_content_cleaned = []
-            for c in final_content:
-                if c is not None:
-                    # Remove internal state like 'partial_json' before returning
+            if req.stream:
+                return StreamingResponse(
+                    event_generator(),
+                    media_type="text/event-stream",
+                    headers=response_headers or None
+                )
+            else:
+                # Non-streaming: accumulate response
+                content_blocks = []
+                usage = {"input_tokens": 0, "output_tokens": 0}
+                stop_reason = None
+                final_content = []
+
+                async for sse_chunk in event_generator():
+                    data_str = None
+                    for line in sse_chunk.strip().split('\n'):
+                        if line.startswith("data:"):
+                            data_str = line[6:].strip()
+                            break
+                    if not data_str or data_str == "[DONE]":
+                        continue
+                    try:
+                        data = json.loads(data_str)
+                        dtype = data.get("type")
+                        if dtype == "content_block_start":
+                            idx = data.get("index", 0)
+                            while len(final_content) <= idx:
+                                final_content.append(None)
+                            final_content[idx] = data.get("content_block")
+                        elif dtype == "content_block_delta":
+                            idx = data.get("index", 0)
+                            delta = data.get("delta", {})
+                            if final_content[idx]:
+                                if delta.get("type") == "text_delta":
+                                    final_content[idx]["text"] += delta.get("text", "")
+                                elif delta.get("type") == "thinking_delta":
+                                    final_content[idx].setdefault("thinking", "")
+                                    final_content[idx]["thinking"] += delta.get("thinking", "")
+                                elif delta.get("type") == "input_json_delta":
+                                    if "partial_json" not in final_content[idx]:
+                                        final_content[idx]["partial_json"] = ""
+                                    final_content[idx]["partial_json"] += delta.get("partial_json", "")
+                        elif dtype == "content_block_stop":
+                            idx = data.get("index", 0)
+                            if final_content[idx] and final_content[idx].get("type") == "tool_use":
+                                if "partial_json" in final_content[idx]:
+                                    try:
+                                        final_content[idx]["input"] = json.loads(final_content[idx]["partial_json"])
+                                    except json.JSONDecodeError:
+                                        final_content[idx]["input"] = {"error": "invalid json", "partial": final_content[idx]["partial_json"]}
+                                    del final_content[idx]["partial_json"]
+                        elif dtype == "message_delta":
+                            usage = data.get("usage", usage)
+                            stop_reason = data.get("delta", {}).get("stop_reason")
+                    except (json.JSONDecodeError, Exception):
+                        pass
+
+                final_content_cleaned = [c for c in final_content if c is not None]
+                for c in final_content_cleaned:
                     c.pop("partial_json", None)
-                    final_content_cleaned.append(c)
 
-            response_body = {
-                "id": f"msg_{uuid.uuid4()}",
-                "type": "message",
-                "role": "assistant",
-                "model": req.model,
-                "content": final_content_cleaned,
-                "stop_reason": stop_reason,
-                "stop_sequence": None,
-                "usage": usage
-            }
-            if conversation_id:
-                response_body["conversation_id"] = conversation_id
-                response_body["conversationId"] = conversation_id
-            return JSONResponse(content=response_body, headers=response_headers or None)
+                response_body = {
+                    "id": f"msg_{uuid.uuid4()}",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": req.model,
+                    "content": final_content_cleaned,
+                    "stop_reason": stop_reason,
+                    "stop_sequence": None,
+                    "usage": usage
+                }
+                if conversation_id:
+                    response_body["conversation_id"] = conversation_id
+                    response_body["conversationId"] = conversation_id
+                return JSONResponse(content=response_body, headers=response_headers or None)
 
-    except Exception as e:
-        # Ensure event_iter (if created) is closed to release upstream connection
-        try:
+        except HTTPException:
+            # Don't retry on HTTP exceptions (auth errors, etc.)
+            if account:
+                await _update_stats(account["id"], False)
+            raise
+        except Exception as e:
+            # Close event_iter if exists
             if event_iter and hasattr(event_iter, "aclose"):
-                await event_iter.aclose()
-        except Exception:
-            pass
-        await _update_stats(account["id"], False)
-        raise
+                try:
+                    await event_iter.aclose()
+                except Exception:
+                    pass
+            if account:
+                await _update_stats(account["id"], False)
+            last_error = e
+
+            # Log retry attempt
+            if attempt < max_attempts - 1:
+                import logging
+                logging.getLogger(__name__).warning(f"Request failed (attempt {attempt + 1}/{max_attempts}), retrying with different account: {str(e)}")
+                continue
+            else:
+                # All retries exhausted
+                raise HTTPException(status_code=502, detail=f"All {max_attempts} attempts failed. Last error: {str(last_error)}")
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens_endpoint(req: ClaudeRequest):
