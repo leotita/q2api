@@ -812,6 +812,12 @@ async def claude_messages(
                     pass
             if account:
                 await _update_stats(account["id"], False)
+
+            # Check for non-retryable errors
+            error_str = str(e)
+            if "CONTENT_LENGTH_EXCEEDS_THRESHOLD" in error_str or "Input is too long" in error_str:
+                raise HTTPException(status_code=400, detail="Input is too long. Please reduce the context length.")
+
             last_error = e
 
             # Log retry attempt and apply exponential backoff
