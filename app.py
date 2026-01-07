@@ -1104,6 +1104,9 @@ async def chat_completions(
     x_api_key: Optional[str] = Header(default=None)
 ):
     """OpenAI-compatible chat endpoint with tool support."""
+    # Debug: print request info
+    print(f"[/v1/chat/completions] Model: {req.model}, Tools: {len(req.tools) if req.tools else 0}, Messages: {len(req.messages)}, Stream: {req.stream}")
+
     bearer_key = _extract_bearer(authorization) if authorization else x_api_key
     model = map_model_name(req.model)
     do_stream = bool(req.stream)
@@ -1129,13 +1132,11 @@ async def chat_completions(
                 aq_request = _convert_openai_messages_to_aq(req.messages, aq_tools)
                 aq_request["conversationState"]["currentMessage"]["userInputMessage"]["modelId"] = model
 
-                # Debug: log request structure
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.info(f"[OpenAI Tools] Tools count: {len(aq_tools)}")
-                logger.info(f"[OpenAI Tools] History length: {len(aq_request.get('conversationState', {}).get('history', []))}")
+                # Debug: print request structure
+                print(f"[OpenAI Tools] Tools count: {len(aq_tools)}, Messages count: {len(req.messages)}")
+                print(f"[OpenAI Tools] History length: {len(aq_request.get('conversationState', {}).get('history', []))}")
                 if os.getenv("DEBUG_MESSAGE_CONVERSION"):
-                    logger.info(f"[OpenAI Tools] Request: {json.dumps(aq_request, ensure_ascii=False, indent=2)[:2000]}...")
+                    print(f"[OpenAI Tools] Full Request:\n{json.dumps(aq_request, ensure_ascii=False, indent=2)}")
 
                 _, _, tracker, event_iter = await send_chat_request(
                     access_token=access, messages=[], model=model, stream=True,
@@ -1209,6 +1210,7 @@ async def chat_completions(
                     return StreamingResponse(event_gen(), media_type="text/event-stream")
             else:
                 # Original logic without tools
+                print(f"[OpenAI No Tools] Messages count: {len(req.messages)}, Stream: {do_stream}")
                 result = await send_chat_request(access, [m.model_dump() for m in req.messages], model=model, stream=do_stream, client=GLOBAL_CLIENT)
                 text, it, tracker = result[0], result[1], result[2]
 
