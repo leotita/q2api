@@ -401,8 +401,13 @@ class OpenAIToolFunction(BaseModel):
     parameters: Optional[Dict[str, Any]] = None
 
 class OpenAITool(BaseModel):
-    type: str = "function"
-    function: OpenAIToolFunction
+    # OpenAI format: {"type": "function", "function": {...}}
+    type: Optional[str] = "function"
+    function: Optional[OpenAIToolFunction] = None
+    # Anthropic/Cursor format: {"name": ..., "input_schema": ...}
+    name: Optional[str] = None
+    description: Optional[str] = None
+    input_schema: Optional[Dict[str, Any]] = None
 
 class OpenAIToolCall(BaseModel):
     id: str
@@ -949,20 +954,32 @@ async def count_tokens_endpoint(req: ClaudeRequest):
     return {"input_tokens": input_tokens}
 
 def _convert_openai_tools_to_aq(tools: List[OpenAITool]) -> List[Dict[str, Any]]:
-    """Convert OpenAI tools to Amazon Q format."""
+    """Convert OpenAI/Anthropic tools to Amazon Q format."""
     aq_tools = []
     for tool in tools:
-        if tool.type == "function":
+        # Support both OpenAI format and Anthropic/Cursor format
+        if tool.function:
+            # OpenAI format: {"type": "function", "function": {...}}
+            name = tool.function.name
             desc = tool.function.description or ""
-            if len(desc) > 10240:
-                desc = desc[:10100] + "\n...(truncated)"
-            aq_tools.append({
-                "toolSpecification": {
-                    "name": tool.function.name,
-                    "description": desc,
-                    "inputSchema": {"json": tool.function.parameters or {"type": "object", "properties": {}}}
-                }
-            })
+            params = tool.function.parameters or {"type": "object", "properties": {}}
+        elif tool.name:
+            # Anthropic/Cursor format: {"name": ..., "input_schema": ...}
+            name = tool.name
+            desc = tool.description or ""
+            params = tool.input_schema or {"type": "object", "properties": {}}
+        else:
+            continue
+
+        if len(desc) > 10240:
+            desc = desc[:10100] + "\n...(truncated)"
+        aq_tools.append({
+            "toolSpecification": {
+                "name": name,
+                "description": desc,
+                "inputSchema": {"json": params}
+            }
+        })
     return aq_tools
 
 def _convert_openai_messages_to_aq(messages: List[ChatMessage], tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
