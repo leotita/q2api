@@ -395,32 +395,14 @@ class AccountUpdate(BaseModel):
     other: Optional[Dict[str, Any]] = None
     enabled: Optional[bool] = None
 
-class OpenAIToolFunction(BaseModel):
-    name: str
-    description: Optional[str] = None
-    parameters: Optional[Dict[str, Any]] = None
-
-class OpenAITool(BaseModel):
-    type: str = "function"
-    function: OpenAIToolFunction
-
-class OpenAIToolCall(BaseModel):
-    id: str
-    type: str = "function"
-    function: Dict[str, str]  # {"name": "...", "arguments": "..."}
-
 class ChatMessage(BaseModel):
     role: str
     content: Any
-    tool_calls: Optional[List[OpenAIToolCall]] = None
-    tool_call_id: Optional[str] = None
 
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = None
     messages: List[ChatMessage]
     stream: Optional[bool] = False
-    tools: Optional[List[OpenAITool]] = None
-    tool_choice: Optional[Any] = None
 
 # ------------------------------------------------------------------------------
 # Token refresh (OIDC)
@@ -534,6 +516,67 @@ async def _update_stats(account_id: str, success: bool) -> None:
             else:
                 await _db.execute("UPDATE accounts SET error_count=?, updated_at=? WHERE id=?",
                            (new_count, time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), account_id))
+
+def _is_non_retryable_error(error: Exception) -> Optional[HTTPException]:
+    """Check if error is non-retryable and return appropriate HTTPException."""
+    error_str = str(error)
+    if "CONTENT_LENGTH_EXCEEDS_THRESHOLD" in error_str or "Input is too long" in error_str:
+        return HTTPException(status_code=400, detail="Input is too long. Please reduce the context length.")
+    return None
+
+async def _get_account_with_retry(bearer_key: Optional[str], tried_account_ids: List[str]) -> Dict[str, Any]:
+    """Get account, resetting exclusion list if all accounts tried."""
+    try:
+        return await resolve_account_for_key(bearer_key, exclude_ids=tried_account_ids if tried_account_ids else None)
+    except HTTPException as he:
+        if "No enabled account available" in str(he.detail) and tried_account_ids:
+            tried_account_ids.clear()
+            return await resolve_account_for_key(bearer_key, exclude_ids=None)
+        raise
+
+async def _ensure_access_token(account: Dict[str, Any]) -> str:
+    """Ensure account has valid access token, refresh if needed."""
+    access = account.get("accessToken")
+    if not access:
+        refreshed = await refresh_access_token_in_db(account["id"])
+        access = refreshed.get("accessToken")
+        if not access:
+            raise HTTPException(status_code=502, detail="Access token unavailable after refresh")
+    return access
+
+async def _handle_retry_error(e: Exception, account: Optional[Dict], attempt: int, max_attempts: int,
+                               tried_account_ids: List[str], cleanup_fn=None) -> Optional[Exception]:
+    """Handle error during retry loop. Returns last_error if should continue, raises if should stop."""
+    import logging
+
+    # Cleanup if provided
+    if cleanup_fn:
+        try:
+            await cleanup_fn()
+        except Exception:
+            pass
+
+    # Update stats
+    if account:
+        await _update_stats(account["id"], False)
+
+    # Check for non-retryable errors
+    non_retryable = _is_non_retryable_error(e)
+    if non_retryable:
+        raise non_retryable
+
+    # Check if HTTPException (auth errors, etc.) - don't retry
+    if isinstance(e, HTTPException):
+        raise e
+
+    # Log and apply backoff if more attempts available
+    if attempt < max_attempts - 1:
+        wait_time = min(3 * (2 ** attempt), 30)
+        logging.getLogger(__name__).warning(f"Request failed (attempt {attempt + 1}/{max_attempts}), retrying in {wait_time}s: {str(e)}")
+        await asyncio.sleep(wait_time)
+        return e
+    else:
+        raise HTTPException(status_code=502, detail=f"All {max_attempts} attempts failed. Last error: {str(e)}")
 
 # ------------------------------------------------------------------------------
 # Dependencies
@@ -715,30 +758,15 @@ async def claude_messages(
 
     # Retry loop with exponential backoff
     tried_account_ids: List[str] = []
-    last_error: Optional[Exception] = None
     max_attempts = MAX_RETRY_COUNT + 1  # +1 for initial attempt
 
     for attempt in range(max_attempts):
         event_iter = None
         account = None
         try:
-            # Get account (excluding previously failed ones)
-            # If no accounts available, reset the exclusion list and try again
-            try:
-                account = await resolve_account_for_key(bearer_key, exclude_ids=tried_account_ids if tried_account_ids else None)
-            except HTTPException as he:
-                if "No enabled account available" in str(he.detail) and tried_account_ids:
-                    # All accounts tried, reset and try again
-                    tried_account_ids = []
-                    account = await resolve_account_for_key(bearer_key, exclude_ids=None)
-                else:
-                    raise
+            account = await _get_account_with_retry(bearer_key, tried_account_ids)
             tried_account_ids.append(account["id"])
-
-            access = account.get("accessToken")
-            if not access:
-                refreshed = await refresh_access_token_in_db(account["id"])
-                access = refreshed.get("accessToken")
+            access = await _ensure_access_token(account)
 
             # Send request
             _, _, tracker, event_iter = await send_chat_request(
@@ -861,40 +889,11 @@ async def claude_messages(
                     response_body["conversationId"] = conversation_id
                 return JSONResponse(content=response_body, headers=response_headers or None)
 
-        except HTTPException:
-            # Don't retry on HTTP exceptions (auth errors, etc.)
-            if account:
-                await _update_stats(account["id"], False)
-            raise
         except Exception as e:
-            # Close event_iter if exists
-            if event_iter and hasattr(event_iter, "aclose"):
-                try:
+            async def cleanup():
+                if event_iter and hasattr(event_iter, "aclose"):
                     await event_iter.aclose()
-                except Exception:
-                    pass
-            if account:
-                await _update_stats(account["id"], False)
-
-            # Check for non-retryable errors
-            error_str = str(e)
-            if "CONTENT_LENGTH_EXCEEDS_THRESHOLD" in error_str or "Input is too long" in error_str:
-                raise HTTPException(status_code=400, detail="Input is too long. Please reduce the context length.")
-
-            last_error = e
-
-            # Log retry attempt and apply exponential backoff
-            if attempt < max_attempts - 1:
-                import logging
-                import asyncio
-                # Exponential backoff: 3s, 6s, 12s, 24s... max 30s
-                wait_time = min(3 * (2 ** attempt), 30)
-                logging.getLogger(__name__).warning(f"Request failed (attempt {attempt + 1}/{max_attempts}), retrying in {wait_time}s with different account: {str(e)}")
-                await asyncio.sleep(wait_time)
-                continue
-            else:
-                # All retries exhausted
-                raise HTTPException(status_code=502, detail=f"All {max_attempts} attempts failed. Last error: {str(last_error)}")
+            await _handle_retry_error(e, account, attempt, max_attempts, tried_account_ids, cleanup)
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens_endpoint(req: ClaudeRequest):
@@ -931,378 +930,87 @@ async def count_tokens_endpoint(req: ClaudeRequest):
     
     return {"input_tokens": input_tokens}
 
-def _convert_openai_tools_to_aq(tools: List[OpenAITool]) -> List[Dict[str, Any]]:
-    """Convert OpenAI tools to Amazon Q format."""
-    aq_tools = []
-    for tool in tools:
-        if tool.type == "function":
-            desc = tool.function.description or ""
-            if len(desc) > 10240:
-                desc = desc[:10100] + "\n...(truncated)"
-            aq_tools.append({
-                "toolSpecification": {
-                    "name": tool.function.name,
-                    "description": desc,
-                    "inputSchema": {"json": tool.function.parameters or {"type": "object", "properties": {}}}
-                }
-            })
-    return aq_tools
-
-def _convert_openai_messages_to_aq(messages: List[ChatMessage], tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """Convert OpenAI messages to Amazon Q request format."""
-    if not messages:
-        return {}
-
-    conversation_id = str(uuid.uuid4())
-    history = []
-    seen_tool_use_ids = set()
-
-    # Pre-process: handle None content in assistant messages
-    processed_messages = []
-    for msg in messages:
-        if msg.role == "assistant" and msg.content is None:
-            # Create a copy with empty string content
-            processed_messages.append(ChatMessage(
-                role=msg.role,
-                content="",
-                tool_calls=msg.tool_calls,
-                tool_call_id=msg.tool_call_id
-            ))
-        else:
-            processed_messages.append(msg)
-
-    # Process all messages except the last one as history
-    for i, msg in enumerate(processed_messages[:-1]):
-        if msg.role == "system":
-            continue  # System messages handled separately
-        elif msg.role == "user":
-            content = msg.content if isinstance(msg.content, str) else json.dumps(msg.content)
-            # Check if we need to merge with previous user message
-            if history and "userInputMessage" in history[-1]:
-                # Merge consecutive user messages
-                prev_content = history[-1]["userInputMessage"]["content"]
-                history[-1]["userInputMessage"]["content"] = f"{prev_content}\n{content}" if prev_content else content
-            else:
-                history.append({
-                    "userInputMessage": {
-                        "content": content,
-                        "userInputMessageContext": {"envState": {"operatingSystem": "macos", "currentWorkingDirectory": "/"}},
-                        "origin": "KIRO_CLI"
-                    }
-                })
-        elif msg.role == "assistant":
-            # Check if we need to merge with previous assistant message
-            if history and "assistantResponseMessage" in history[-1]:
-                # Merge consecutive assistant messages
-                prev = history[-1]["assistantResponseMessage"]
-                text_content = msg.content if isinstance(msg.content, str) else ""
-                prev["content"] = f"{prev['content']} {text_content}".strip()
-                # Merge tool_calls
-                if msg.tool_calls:
-                    if "toolUses" not in prev:
-                        prev["toolUses"] = []
-                    for tc in msg.tool_calls:
-                        tc_dict = tc.model_dump() if hasattr(tc, 'model_dump') else tc
-                        tid = tc_dict.get("id")
-                        if tid and tid not in seen_tool_use_ids:
-                            seen_tool_use_ids.add(tid)
-                            try:
-                                input_data = json.loads(tc_dict["function"]["arguments"]) if tc_dict["function"]["arguments"] else {}
-                            except json.JSONDecodeError:
-                                input_data = {}
-                            prev["toolUses"].append({
-                                "toolUseId": tid,
-                                "name": tc_dict["function"]["name"],
-                                "input": input_data
-                            })
-            else:
-                text_content = msg.content if isinstance(msg.content, str) else ""
-                entry = {
-                    "assistantResponseMessage": {
-                        "messageId": str(uuid.uuid4()),
-                        "content": text_content
-                    }
-                }
-                # Handle tool_calls
-                if msg.tool_calls:
-                    tool_uses = []
-                    for tc in msg.tool_calls:
-                        tc_dict = tc.model_dump() if hasattr(tc, 'model_dump') else tc
-                        tid = tc_dict.get("id")
-                        if tid and tid not in seen_tool_use_ids:
-                            seen_tool_use_ids.add(tid)
-                            try:
-                                input_data = json.loads(tc_dict["function"]["arguments"]) if tc_dict["function"]["arguments"] else {}
-                            except json.JSONDecodeError:
-                                input_data = {}
-                            tool_uses.append({
-                                "toolUseId": tid,
-                                "name": tc_dict["function"]["name"],
-                                "input": input_data
-                            })
-                    if tool_uses:
-                        entry["assistantResponseMessage"]["toolUses"] = tool_uses
-                history.append(entry)
-        elif msg.role == "tool":
-            # Tool result - must follow assistant message, create user message with toolResults
-            tool_result = {
-                "toolUseId": msg.tool_call_id,
-                "content": [{"text": msg.content if isinstance(msg.content, str) else json.dumps(msg.content)}],
-                "status": "success"
-            }
-            # Check if previous message is user with toolResults (merge multiple tool results)
-            if history and "userInputMessage" in history[-1]:
-                ctx = history[-1]["userInputMessage"].setdefault("userInputMessageContext", {})
-                ctx.setdefault("toolResults", []).append(tool_result)
-            else:
-                # Create new user message for tool result
-                history.append({
-                    "userInputMessage": {
-                        "content": "",
-                        "userInputMessageContext": {
-                            "envState": {"operatingSystem": "macos", "currentWorkingDirectory": "/"},
-                            "toolResults": [tool_result]
-                        },
-                        "origin": "KIRO_CLI"
-                    }
-                })
-
-    # Process the last message as currentMessage
-    last_msg = processed_messages[-1] if processed_messages else None
-    current_content = ""
-    tool_results = None
-
-    if last_msg:
-        if last_msg.role == "user":
-            current_content = last_msg.content if isinstance(last_msg.content, str) else json.dumps(last_msg.content)
-        elif last_msg.role == "tool":
-            tool_results = [{
-                "toolUseId": last_msg.tool_call_id,
-                "content": [{"text": last_msg.content if isinstance(last_msg.content, str) else json.dumps(last_msg.content)}],
-                "status": "success"
-            }]
-        elif last_msg.role == "assistant":
-            # If last message is assistant, add it to history and use empty current message
-            text_content = last_msg.content if isinstance(last_msg.content, str) else ""
-            entry = {
-                "assistantResponseMessage": {
-                    "messageId": str(uuid.uuid4()),
-                    "content": text_content
-                }
-            }
-            if last_msg.tool_calls:
-                tool_uses = []
-                for tc in last_msg.tool_calls:
-                    tc_dict = tc.model_dump() if hasattr(tc, 'model_dump') else tc
-                    tid = tc_dict.get("id")
-                    if tid and tid not in seen_tool_use_ids:
-                        seen_tool_use_ids.add(tid)
-                        try:
-                            input_data = json.loads(tc_dict["function"]["arguments"]) if tc_dict["function"]["arguments"] else {}
-                        except json.JSONDecodeError:
-                            input_data = {}
-                        tool_uses.append({
-                            "toolUseId": tid,
-                            "name": tc_dict["function"]["name"],
-                            "input": input_data
-                        })
-                if tool_uses:
-                    entry["assistantResponseMessage"]["toolUses"] = tool_uses
-            history.append(entry)
-            current_content = "continue"  # Placeholder for continuation
-
-    # Extract system prompt
-    system_text = ""
-    for msg in messages:
-        if msg.role == "system":
-            system_text += (msg.content if isinstance(msg.content, str) else "") + "\n"
-
-    # Format content with system prompt
-    if system_text.strip():
-        formatted_content = f"--- SYSTEM PROMPT BEGIN ---\n{system_text.strip()}\n--- SYSTEM PROMPT END ---\n\n"
-        formatted_content += f"--- USER MESSAGE BEGIN ---\n{current_content}\n--- USER MESSAGE END ---"
-    else:
-        formatted_content = current_content
-
-    user_ctx = {"envState": {"operatingSystem": "macos", "currentWorkingDirectory": "/"}}
-    if tools:
-        user_ctx["tools"] = tools
-    if tool_results:
-        user_ctx["toolResults"] = tool_results
-
-    return {
-        "conversationState": {
-            "conversationId": conversation_id,
-            "history": history,
-            "currentMessage": {
-                "userInputMessage": {
-                    "content": formatted_content,
-                    "userInputMessageContext": user_ctx,
-                    "origin": "KIRO_CLI",
-                    "modelId": None  # Will be set by caller
-                }
-            },
-            "chatTriggerType": "MANUAL"
-        }
-    }
-
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] = Depends(require_account)):
-    """OpenAI-compatible chat endpoint with tool support."""
+async def chat_completions(
+    req: ChatCompletionRequest,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None)
+):
+    """
+    OpenAI-compatible chat endpoint with retry support.
+    """
+    bearer_key = _extract_bearer(authorization) if authorization else x_api_key
     model = map_model_name(req.model)
     do_stream = bool(req.stream)
-
-    # Convert tools
-    aq_tools = _convert_openai_tools_to_aq(req.tools) if req.tools else None
-
-    # Convert messages to Amazon Q format
-    aq_request = _convert_openai_messages_to_aq(req.messages, aq_tools)
-    aq_request["conversationState"]["currentMessage"]["userInputMessage"]["modelId"] = model
-
-    # Get access token
-    access = account.get("accessToken")
-    if not access:
-        refreshed = await refresh_access_token_in_db(account["id"])
-        access = refreshed.get("accessToken")
-        if not access:
-            raise HTTPException(status_code=502, detail="Access token unavailable after refresh")
-
-    # Calculate prompt tokens
     prompt_text = "".join([m.content for m in req.messages if isinstance(m.content, str)])
     prompt_tokens = count_tokens(prompt_text)
 
-    if not do_stream:
-        # Non-streaming: use event stream and accumulate
+    # Retry loop
+    tried_account_ids: List[str] = []
+    max_attempts = MAX_RETRY_COUNT + 1
+
+    for attempt in range(max_attempts):
+        it = None
+        account = None
         try:
-            _, _, tracker, event_iter = await send_chat_request(
-                access_token=access, messages=[], model=model, stream=True,
-                client=GLOBAL_CLIENT, raw_payload=aq_request
-            )
+            account = await _get_account_with_retry(bearer_key, tried_account_ids)
+            tried_account_ids.append(account["id"])
+            access = await _ensure_access_token(account)
 
-            text_parts = []
-            tool_calls = []
-            tool_index = 0
-            current_tool = None
+            result = await send_chat_request(access, [m.model_dump() for m in req.messages], model=model, stream=do_stream, client=GLOBAL_CLIENT)
+            text, it, tracker = result[0], result[1], result[2]
 
-            async for event_type, payload in event_iter:
-                if event_type == "assistantResponseEvent":
-                    text_parts.append(payload.get("content", ""))
-                elif event_type == "toolUseEvent":
-                    tid = payload.get("toolUseId")
-                    name = payload.get("name")
-                    inp = payload.get("input", {})
-                    is_stop = payload.get("stop", False)
+            if not do_stream:
+                await _update_stats(account["id"], bool(text))
+                completion_tokens = count_tokens(text or "")
+                return JSONResponse(content=_openai_non_streaming_response(
+                    text or "", model, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens
+                ))
+            else:
+                # Verify stream is valid
+                if it is None:
+                    raise Exception("No stream returned")
 
-                    if tid and name and not current_tool:
-                        current_tool = {"id": tid, "name": name, "args": []}
-                    if current_tool and inp:
-                        current_tool["args"].append(json.dumps(inp, ensure_ascii=False) if not isinstance(inp, str) else inp)
-                    if is_stop and current_tool:
-                        tool_calls.append({
-                            "id": current_tool["id"],
-                            "type": "function",
-                            "function": {"name": current_tool["name"], "arguments": "".join(current_tool["args"])}
+                created = int(time.time())
+                stream_id = f"chatcmpl-{uuid.uuid4()}"
+                current_account = account
+                current_tracker = tracker
+
+                async def event_gen() -> AsyncGenerator[str, None]:
+                    completion_text = ""
+                    try:
+                        yield _sse_format({
+                            "id": stream_id, "object": "chat.completion.chunk", "created": created,
+                            "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
                         })
-                        current_tool = None
-                        tool_index += 1
+                        async for piece in it:
+                            if piece:
+                                completion_text += piece
+                                yield _sse_format({
+                                    "id": stream_id, "object": "chat.completion.chunk", "created": created,
+                                    "model": model, "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
+                                })
+                        completion_tokens = count_tokens(completion_text)
+                        yield _sse_format({
+                            "id": stream_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens}
+                        })
+                        yield "data: [DONE]\n\n"
+                        await _update_stats(current_account["id"], True)
+                    except GeneratorExit:
+                        await _update_stats(current_account["id"], current_tracker.has_content if current_tracker else False)
+                    except Exception:
+                        await _update_stats(current_account["id"], False)
+                        raise
 
-            await _update_stats(account["id"], True)
+                return StreamingResponse(event_gen(), media_type="text/event-stream")
 
-            text = "".join(text_parts)
-            completion_tokens = count_tokens(text)
-
-            response = {
-                "id": f"chatcmpl-{uuid.uuid4()}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "tool_calls" if tool_calls else "stop"
-                }],
-                "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens}
-            }
-            if tool_calls:
-                response["choices"][0]["message"]["tool_calls"] = tool_calls
-
-            return JSONResponse(content=response)
-        except Exception:
-            await _update_stats(account["id"], False)
-            raise
-    else:
-        # Streaming response
-        stream_id = f"chatcmpl-{uuid.uuid4()}"
-        created = int(time.time())
-
-        try:
-            _, _, tracker, event_iter = await send_chat_request(
-                access_token=access, messages=[], model=model, stream=True,
-                client=GLOBAL_CLIENT, raw_payload=aq_request
-            )
-
-            async def event_gen() -> AsyncGenerator[str, None]:
-                completion_text = ""
-                tool_calls_made = False
-                tool_index = 0
-                current_tool = None
-                role_sent = False
-
-                try:
-                    async for event_type, payload in event_iter:
-                        if event_type == "assistantResponseEvent":
-                            content = payload.get("content", "")
-                            if content:
-                                if not role_sent:
-                                    yield _sse_format({"id": stream_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
-                                    role_sent = True
-                                completion_text += content
-                                yield _sse_format({"id": stream_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]})
-
-                        elif event_type == "toolUseEvent":
-                            tid = payload.get("toolUseId")
-                            name = payload.get("name")
-                            inp = payload.get("input", {})
-                            is_stop = payload.get("stop", False)
-
-                            if tid and name and not current_tool:
-                                tool_calls_made = True
-                                current_tool = {"id": tid, "name": name}
-                                if not role_sent:
-                                    yield _sse_format({"id": stream_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
-                                    role_sent = True
-                                yield _sse_format({"id": stream_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                    "choices": [{"index": 0, "delta": {"tool_calls": [{"index": tool_index, "id": tid, "type": "function", "function": {"name": name, "arguments": ""}}]}, "finish_reason": None}]})
-
-                            if current_tool and inp:
-                                args = json.dumps(inp, ensure_ascii=False) if not isinstance(inp, str) else inp
-                                yield _sse_format({"id": stream_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                    "choices": [{"index": 0, "delta": {"tool_calls": [{"index": tool_index, "function": {"arguments": args}}]}, "finish_reason": None}]})
-
-                            if is_stop and current_tool:
-                                current_tool = None
-                                tool_index += 1
-
-                    # Final chunk
-                    completion_tokens = count_tokens(completion_text)
-                    yield _sse_format({"id": stream_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if tool_calls_made else "stop"}],
-                        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens}})
-                    yield "data: [DONE]\n\n"
-                    await _update_stats(account["id"], True)
-                except GeneratorExit:
-                    await _update_stats(account["id"], tracker.has_content if tracker else False)
-                except Exception:
-                    await _update_stats(account["id"], False)
-                    raise
-
-            return StreamingResponse(event_gen(), media_type="text/event-stream")
-        except Exception:
-            await _update_stats(account["id"], False)
-            raise
+        except Exception as e:
+            async def cleanup():
+                if it and hasattr(it, "aclose"):
+                    await it.aclose()
+            await _handle_retry_error(e, account, attempt, max_attempts, tried_account_ids, cleanup)
 
 # ------------------------------------------------------------------------------
 # Device Authorization (URL Login, 5-minute timeout)
