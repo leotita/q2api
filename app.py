@@ -985,7 +985,7 @@ def _convert_openai_tools_to_aq(tools: List[OpenAITool]) -> List[Dict[str, Any]]
 def _convert_openai_messages_to_aq(messages: List[ChatMessage], tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Convert OpenAI messages to Amazon Q request format with proper message alternation."""
     if not messages:
-        return {}
+        return {"conversationState": {"conversationId": str(uuid.uuid4()), "history": [], "currentMessage": {"userInputMessage": {"content": "", "userInputMessageContext": {"envState": {"operatingSystem": "macos", "currentWorkingDirectory": "/"}}, "origin": "KIRO_CLI", "modelId": None}}, "chatTriggerType": "MANUAL"}}
 
     conversation_id = str(uuid.uuid4())
     history = []
@@ -1004,15 +1004,22 @@ def _convert_openai_messages_to_aq(messages: List[ChatMessage], tools: Optional[
         if msg.role == "system":
             continue
         elif msg.role == "user":
-            content = msg.content if isinstance(msg.content, str) else json.dumps(msg.content)
+            content = msg.content if isinstance(msg.content, str) else json.dumps(msg.content) if msg.content else ""
             if history and "userInputMessage" in history[-1]:
-                history[-1]["userInputMessage"]["content"] += f"\n{content}"
+                # Merge consecutive user messages
+                prev = history[-1]["userInputMessage"]
+                prev["content"] = (prev.get("content", "") + "\n" + content).strip()
             else:
                 history.append({"userInputMessage": {"content": content, "userInputMessageContext": {"envState": {"operatingSystem": "macos", "currentWorkingDirectory": "/"}}, "origin": "KIRO_CLI"}})
         elif msg.role == "assistant":
             text_content = msg.content if isinstance(msg.content, str) else ""
             if history and "assistantResponseMessage" in history[-1]:
-                history[-1]["assistantResponseMessage"]["content"] += f" {text_content}"
+                # Merge consecutive assistant messages
+                prev = history[-1]["assistantResponseMessage"]
+                prev["content"] = (prev.get("content", "") + " " + text_content).strip()
+                # Also merge tool_calls
+                if msg.tool_calls and "toolUses" not in prev:
+                    prev["toolUses"] = []
             else:
                 entry = {"assistantResponseMessage": {"messageId": str(uuid.uuid4()), "content": text_content}}
                 if msg.tool_calls:
@@ -1023,18 +1030,22 @@ def _convert_openai_messages_to_aq(messages: List[ChatMessage], tools: Optional[
                         if tid and tid not in seen_tool_use_ids:
                             seen_tool_use_ids.add(tid)
                             try:
-                                input_data = json.loads(tc_dict["function"]["arguments"]) if tc_dict["function"]["arguments"] else {}
+                                args = tc_dict.get("function", {}).get("arguments", "")
+                                input_data = json.loads(args) if args else {}
                             except json.JSONDecodeError:
                                 input_data = {}
-                            tool_uses.append({"toolUseId": tid, "name": tc_dict["function"]["name"], "input": input_data})
+                            tool_uses.append({"toolUseId": tid, "name": tc_dict.get("function", {}).get("name", ""), "input": input_data})
                     if tool_uses:
                         entry["assistantResponseMessage"]["toolUses"] = tool_uses
                 history.append(entry)
         elif msg.role == "tool":
-            tool_result = {"toolUseId": msg.tool_call_id, "content": [{"text": msg.content if isinstance(msg.content, str) else json.dumps(msg.content)}], "status": "success"}
+            tool_result = {"toolUseId": msg.tool_call_id or "", "content": [{"text": msg.content if isinstance(msg.content, str) else json.dumps(msg.content) if msg.content else ""}], "status": "success"}
             if history and "userInputMessage" in history[-1]:
-                history[-1]["userInputMessage"].setdefault("userInputMessageContext", {}).setdefault("toolResults", []).append(tool_result)
+                # Merge tool results into existing user message
+                ctx = history[-1]["userInputMessage"].setdefault("userInputMessageContext", {"envState": {"operatingSystem": "macos", "currentWorkingDirectory": "/"}})
+                ctx.setdefault("toolResults", []).append(tool_result)
             else:
+                # Create new user message for tool result
                 history.append({"userInputMessage": {"content": "", "userInputMessageContext": {"envState": {"operatingSystem": "macos", "currentWorkingDirectory": "/"}, "toolResults": [tool_result]}, "origin": "KIRO_CLI"}})
 
     # Process last message
@@ -1043,10 +1054,11 @@ def _convert_openai_messages_to_aq(messages: List[ChatMessage], tools: Optional[
 
     if last_msg:
         if last_msg.role == "user":
-            current_content = last_msg.content if isinstance(last_msg.content, str) else json.dumps(last_msg.content)
+            current_content = last_msg.content if isinstance(last_msg.content, str) else json.dumps(last_msg.content) if last_msg.content else ""
         elif last_msg.role == "tool":
-            tool_results = [{"toolUseId": last_msg.tool_call_id, "content": [{"text": last_msg.content if isinstance(last_msg.content, str) else json.dumps(last_msg.content)}], "status": "success"}]
+            tool_results = [{"toolUseId": last_msg.tool_call_id or "", "content": [{"text": last_msg.content if isinstance(last_msg.content, str) else json.dumps(last_msg.content) if last_msg.content else ""}], "status": "success"}]
         elif last_msg.role == "assistant":
+            # Add assistant to history and use placeholder for current
             entry = {"assistantResponseMessage": {"messageId": str(uuid.uuid4()), "content": last_msg.content if isinstance(last_msg.content, str) else ""}}
             if last_msg.tool_calls:
                 tool_uses = []
@@ -1056,18 +1068,26 @@ def _convert_openai_messages_to_aq(messages: List[ChatMessage], tools: Optional[
                     if tid and tid not in seen_tool_use_ids:
                         seen_tool_use_ids.add(tid)
                         try:
-                            input_data = json.loads(tc_dict["function"]["arguments"]) if tc_dict["function"]["arguments"] else {}
+                            args = tc_dict.get("function", {}).get("arguments", "")
+                            input_data = json.loads(args) if args else {}
                         except json.JSONDecodeError:
                             input_data = {}
-                        tool_uses.append({"toolUseId": tid, "name": tc_dict["function"]["name"], "input": input_data})
+                        tool_uses.append({"toolUseId": tid, "name": tc_dict.get("function", {}).get("name", ""), "input": input_data})
                 if tool_uses:
                     entry["assistantResponseMessage"]["toolUses"] = tool_uses
             history.append(entry)
             current_content = "continue"
+        elif last_msg.role == "system":
+            current_content = ""
 
     # Extract system prompt
     system_text = "".join((msg.content if isinstance(msg.content, str) else "") + "\n" for msg in messages if msg.role == "system")
     formatted_content = f"--- SYSTEM PROMPT BEGIN ---\n{system_text.strip()}\n--- SYSTEM PROMPT END ---\n\n--- USER MESSAGE BEGIN ---\n{current_content}\n--- USER MESSAGE END ---" if system_text.strip() else current_content
+
+    # Ensure history alternates correctly (user-assistant-user-assistant...)
+    # If first message is assistant, prepend a placeholder user message
+    if history and "assistantResponseMessage" in history[0]:
+        history.insert(0, {"userInputMessage": {"content": "...", "userInputMessageContext": {"envState": {"operatingSystem": "macos", "currentWorkingDirectory": "/"}}, "origin": "KIRO_CLI"}})
 
     user_ctx = {"envState": {"operatingSystem": "macos", "currentWorkingDirectory": "/"}}
     if tools:
@@ -1108,6 +1128,14 @@ async def chat_completions(
                 aq_tools = _convert_openai_tools_to_aq(req.tools)
                 aq_request = _convert_openai_messages_to_aq(req.messages, aq_tools)
                 aq_request["conversationState"]["currentMessage"]["userInputMessage"]["modelId"] = model
+
+                # Debug: log request structure
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(f"[OpenAI Tools] Tools count: {len(aq_tools)}")
+                logger.info(f"[OpenAI Tools] History length: {len(aq_request.get('conversationState', {}).get('history', []))}")
+                if os.getenv("DEBUG_MESSAGE_CONVERSION"):
+                    logger.info(f"[OpenAI Tools] Request: {json.dumps(aq_request, ensure_ascii=False, indent=2)[:2000]}...")
 
                 _, _, tracker, event_iter = await send_chat_request(
                     access_token=access, messages=[], model=model, stream=True,
