@@ -517,6 +517,67 @@ async def _update_stats(account_id: str, success: bool) -> None:
                 await _db.execute("UPDATE accounts SET error_count=?, updated_at=? WHERE id=?",
                            (new_count, time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), account_id))
 
+def _is_non_retryable_error(error: Exception) -> Optional[HTTPException]:
+    """Check if error is non-retryable and return appropriate HTTPException."""
+    error_str = str(error)
+    if "CONTENT_LENGTH_EXCEEDS_THRESHOLD" in error_str or "Input is too long" in error_str:
+        return HTTPException(status_code=400, detail="Input is too long. Please reduce the context length.")
+    return None
+
+async def _get_account_with_retry(bearer_key: Optional[str], tried_account_ids: List[str]) -> Dict[str, Any]:
+    """Get account, resetting exclusion list if all accounts tried."""
+    try:
+        return await resolve_account_for_key(bearer_key, exclude_ids=tried_account_ids if tried_account_ids else None)
+    except HTTPException as he:
+        if "No enabled account available" in str(he.detail) and tried_account_ids:
+            tried_account_ids.clear()
+            return await resolve_account_for_key(bearer_key, exclude_ids=None)
+        raise
+
+async def _ensure_access_token(account: Dict[str, Any]) -> str:
+    """Ensure account has valid access token, refresh if needed."""
+    access = account.get("accessToken")
+    if not access:
+        refreshed = await refresh_access_token_in_db(account["id"])
+        access = refreshed.get("accessToken")
+        if not access:
+            raise HTTPException(status_code=502, detail="Access token unavailable after refresh")
+    return access
+
+async def _handle_retry_error(e: Exception, account: Optional[Dict], attempt: int, max_attempts: int,
+                               tried_account_ids: List[str], cleanup_fn=None) -> Optional[Exception]:
+    """Handle error during retry loop. Returns last_error if should continue, raises if should stop."""
+    import logging
+
+    # Cleanup if provided
+    if cleanup_fn:
+        try:
+            await cleanup_fn()
+        except Exception:
+            pass
+
+    # Update stats
+    if account:
+        await _update_stats(account["id"], False)
+
+    # Check for non-retryable errors
+    non_retryable = _is_non_retryable_error(e)
+    if non_retryable:
+        raise non_retryable
+
+    # Check if HTTPException (auth errors, etc.) - don't retry
+    if isinstance(e, HTTPException):
+        raise e
+
+    # Log and apply backoff if more attempts available
+    if attempt < max_attempts - 1:
+        wait_time = min(3 * (2 ** attempt), 30)
+        logging.getLogger(__name__).warning(f"Request failed (attempt {attempt + 1}/{max_attempts}), retrying in {wait_time}s: {str(e)}")
+        await asyncio.sleep(wait_time)
+        return e
+    else:
+        raise HTTPException(status_code=502, detail=f"All {max_attempts} attempts failed. Last error: {str(e)}")
+
 # ------------------------------------------------------------------------------
 # Dependencies
 # ------------------------------------------------------------------------------
@@ -697,30 +758,15 @@ async def claude_messages(
 
     # Retry loop with exponential backoff
     tried_account_ids: List[str] = []
-    last_error: Optional[Exception] = None
     max_attempts = MAX_RETRY_COUNT + 1  # +1 for initial attempt
 
     for attempt in range(max_attempts):
         event_iter = None
         account = None
         try:
-            # Get account (excluding previously failed ones)
-            # If no accounts available, reset the exclusion list and try again
-            try:
-                account = await resolve_account_for_key(bearer_key, exclude_ids=tried_account_ids if tried_account_ids else None)
-            except HTTPException as he:
-                if "No enabled account available" in str(he.detail) and tried_account_ids:
-                    # All accounts tried, reset and try again
-                    tried_account_ids = []
-                    account = await resolve_account_for_key(bearer_key, exclude_ids=None)
-                else:
-                    raise
+            account = await _get_account_with_retry(bearer_key, tried_account_ids)
             tried_account_ids.append(account["id"])
-
-            access = account.get("accessToken")
-            if not access:
-                refreshed = await refresh_access_token_in_db(account["id"])
-                access = refreshed.get("accessToken")
+            access = await _ensure_access_token(account)
 
             # Send request
             _, _, tracker, event_iter = await send_chat_request(
@@ -843,40 +889,11 @@ async def claude_messages(
                     response_body["conversationId"] = conversation_id
                 return JSONResponse(content=response_body, headers=response_headers or None)
 
-        except HTTPException:
-            # Don't retry on HTTP exceptions (auth errors, etc.)
-            if account:
-                await _update_stats(account["id"], False)
-            raise
         except Exception as e:
-            # Close event_iter if exists
-            if event_iter and hasattr(event_iter, "aclose"):
-                try:
+            async def cleanup():
+                if event_iter and hasattr(event_iter, "aclose"):
                     await event_iter.aclose()
-                except Exception:
-                    pass
-            if account:
-                await _update_stats(account["id"], False)
-
-            # Check for non-retryable errors
-            error_str = str(e)
-            if "CONTENT_LENGTH_EXCEEDS_THRESHOLD" in error_str or "Input is too long" in error_str:
-                raise HTTPException(status_code=400, detail="Input is too long. Please reduce the context length.")
-
-            last_error = e
-
-            # Log retry attempt and apply exponential backoff
-            if attempt < max_attempts - 1:
-                import logging
-                import asyncio
-                # Exponential backoff: 3s, 6s, 12s, 24s... max 30s
-                wait_time = min(3 * (2 ** attempt), 30)
-                logging.getLogger(__name__).warning(f"Request failed (attempt {attempt + 1}/{max_attempts}), retrying in {wait_time}s with different account: {str(e)}")
-                await asyncio.sleep(wait_time)
-                continue
-            else:
-                # All retries exhausted
-                raise HTTPException(status_code=502, detail=f"All {max_attempts} attempts failed. Last error: {str(last_error)}")
+            await _handle_retry_error(e, account, attempt, max_attempts, tried_account_ids, cleanup)
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens_endpoint(req: ClaudeRequest):
@@ -914,121 +931,86 @@ async def count_tokens_endpoint(req: ClaudeRequest):
     return {"input_tokens": input_tokens}
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] = Depends(require_account)):
+async def chat_completions(
+    req: ChatCompletionRequest,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None)
+):
     """
-    OpenAI-compatible chat endpoint.
-    - stream default False
-    - messages will be converted into "{role}:\n{content}" and injected into template
-    - account is chosen randomly among enabled accounts (API key is for authorization only)
+    OpenAI-compatible chat endpoint with retry support.
     """
+    bearer_key = _extract_bearer(authorization) if authorization else x_api_key
     model = map_model_name(req.model)
     do_stream = bool(req.stream)
+    prompt_text = "".join([m.content for m in req.messages if isinstance(m.content, str)])
+    prompt_tokens = count_tokens(prompt_text)
 
-    async def _send_upstream(stream: bool) -> Tuple[Optional[str], Optional[AsyncGenerator[str, None]], Any]:
-        access = account.get("accessToken")
-        if not access:
-            refreshed = await refresh_access_token_in_db(account["id"])
-            access = refreshed.get("accessToken")
-            if not access:
-                raise HTTPException(status_code=502, detail="Access token unavailable after refresh")
-        # Note: send_chat_request signature changed, but we use keyword args so it should be fine if we don't pass raw_payload
-        # But wait, the return signature changed too! It now returns 4 values.
-        # We need to unpack 4 values.
-        result = await send_chat_request(access, [m.model_dump() for m in req.messages], model=model, stream=stream, client=GLOBAL_CLIENT)
-        return result[0], result[1], result[2] # Ignore the 4th value (event_stream) for OpenAI endpoint
+    # Retry loop
+    tried_account_ids: List[str] = []
+    max_attempts = MAX_RETRY_COUNT + 1
 
-    if not do_stream:
-        try:
-            # Calculate prompt tokens
-            prompt_text = "".join([m.content for m in req.messages if isinstance(m.content, str)])
-            prompt_tokens = count_tokens(prompt_text)
-
-            text, _, tracker = await _send_upstream(stream=False)
-            await _update_stats(account["id"], bool(text))
-            
-            completion_tokens = count_tokens(text or "")
-            
-            return JSONResponse(content=_openai_non_streaming_response(
-                text or "",
-                model,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens
-            ))
-        except Exception as e:
-            await _update_stats(account["id"], False)
-            raise
-    else:
-        created = int(time.time())
-        stream_id = f"chatcmpl-{uuid.uuid4()}"
-        model_used = model or "unknown"
-        
+    for attempt in range(max_attempts):
         it = None
+        account = None
         try:
-            # Calculate prompt tokens
-            prompt_text = "".join([m.content for m in req.messages if isinstance(m.content, str)])
-            prompt_tokens = count_tokens(prompt_text)
+            account = await _get_account_with_retry(bearer_key, tried_account_ids)
+            tried_account_ids.append(account["id"])
+            access = await _ensure_access_token(account)
 
-            _, it, tracker = await _send_upstream(stream=True)
-            assert it is not None
-            
-            async def event_gen() -> AsyncGenerator[str, None]:
-                completion_text = ""
-                try:
-                    # Send role first
-                    yield _sse_format({
-                        "id": stream_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_used,
-                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-                    })
-                    
-                    # Stream content
-                    async for piece in it:
-                        if piece:
-                            completion_text += piece
-                            yield _sse_format({
-                                "id": stream_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_used,
-                                "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
-                            })
-                    
-                    # Send stop and usage
-                    completion_tokens = count_tokens(completion_text)
-                    yield _sse_format({
-                        "id": stream_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_used,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                        "usage": {
-                            "prompt_tokens": prompt_tokens,
-                            "completion_tokens": completion_tokens,
-                            "total_tokens": prompt_tokens + completion_tokens,
-                        }
-                    })
-                    
-                    yield "data: [DONE]\n\n"
-                    await _update_stats(account["id"], True)
-                except GeneratorExit:
-                    # Client disconnected - update stats but don't re-raise
-                    await _update_stats(account["id"], tracker.has_content if tracker else False)
-                except Exception:
-                    await _update_stats(account["id"], tracker.has_content if tracker else False)
-                    raise
-            
-            return StreamingResponse(event_gen(), media_type="text/event-stream")
+            result = await send_chat_request(access, [m.model_dump() for m in req.messages], model=model, stream=do_stream, client=GLOBAL_CLIENT)
+            text, it, tracker = result[0], result[1], result[2]
+
+            if not do_stream:
+                await _update_stats(account["id"], bool(text))
+                completion_tokens = count_tokens(text or "")
+                return JSONResponse(content=_openai_non_streaming_response(
+                    text or "", model, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens
+                ))
+            else:
+                # Verify stream is valid
+                if it is None:
+                    raise Exception("No stream returned")
+
+                created = int(time.time())
+                stream_id = f"chatcmpl-{uuid.uuid4()}"
+                current_account = account
+                current_tracker = tracker
+
+                async def event_gen() -> AsyncGenerator[str, None]:
+                    completion_text = ""
+                    try:
+                        yield _sse_format({
+                            "id": stream_id, "object": "chat.completion.chunk", "created": created,
+                            "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                        })
+                        async for piece in it:
+                            if piece:
+                                completion_text += piece
+                                yield _sse_format({
+                                    "id": stream_id, "object": "chat.completion.chunk", "created": created,
+                                    "model": model, "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
+                                })
+                        completion_tokens = count_tokens(completion_text)
+                        yield _sse_format({
+                            "id": stream_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens}
+                        })
+                        yield "data: [DONE]\n\n"
+                        await _update_stats(current_account["id"], True)
+                    except GeneratorExit:
+                        await _update_stats(current_account["id"], current_tracker.has_content if current_tracker else False)
+                    except Exception:
+                        await _update_stats(current_account["id"], False)
+                        raise
+
+                return StreamingResponse(event_gen(), media_type="text/event-stream")
+
         except Exception as e:
-            # Ensure iterator (if created) is closed to release upstream connection
-            try:
+            async def cleanup():
                 if it and hasattr(it, "aclose"):
                     await it.aclose()
-            except Exception:
-                pass
-            await _update_stats(account["id"], False)
-            raise
+            await _handle_retry_error(e, account, attempt, max_attempts, tried_account_ids, cleanup)
 
 # ------------------------------------------------------------------------------
 # Device Authorization (URL Login, 5-minute timeout)
