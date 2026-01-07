@@ -1,3 +1,4 @@
+import os
 import json
 import uuid
 import time
@@ -106,11 +107,38 @@ def _process_tool_result_block(block: Dict[str, Any]) -> Dict[str, Any]:
         "status": status
     }
 
+def _parse_model_mapping_env() -> Dict[str, str]:
+    """Parse MODEL_MAPPING environment variable.
+
+    Format: MODEL_MAPPING=alias1:target1,alias2:target2
+    Example: MODEL_MAPPING=GLM-4.6:claude-opus-4-5-20251101,MiniMax-M2:claude-sonnet-4-5-20250929
+    """
+    mapping = {}
+    env_val = os.getenv("MODEL_MAPPING", "").strip()
+    if not env_val:
+        return mapping
+    for pair in env_val.split(","):
+        pair = pair.strip()
+        if ":" in pair:
+            alias, target = pair.split(":", 1)
+            alias = alias.strip()
+            target = target.strip()
+            if alias and target:
+                mapping[alias.lower()] = target
+    return mapping
+
+# Parse custom model mapping from environment at module load time
+_CUSTOM_MODEL_MAPPING = _parse_model_mapping_env()
+
 def map_model_name(claude_model: str) -> str:
     """Map Claude model name to Amazon Q model ID.
 
     Accepts both short names (e.g., claude-sonnet-4) and canonical names
     (e.g., claude-sonnet-4-20250514).
+
+    Also supports custom mapping via MODEL_MAPPING environment variable.
+    Format: MODEL_MAPPING=alias1:target1,alias2:target2
+    Example: MODEL_MAPPING=GLM-4.6:claude-opus-4-5-20251101,MiniMax-M2:claude-sonnet-4-5-20250929
     """
     DEFAULT_MODEL = "claude-sonnet-4.5"
 
@@ -130,6 +158,12 @@ def map_model_name(claude_model: str) -> str:
     }
 
     model_lower = claude_model.lower()
+
+    # Check custom mapping first (highest priority)
+    if model_lower in _CUSTOM_MODEL_MAPPING:
+        target = _CUSTOM_MODEL_MAPPING[model_lower]
+        # Recursively map the target in case it's a canonical name
+        return map_model_name(target)
 
     # Check if it's a valid short name (but not "auto" which Amazon Q doesn't accept)
     if model_lower in VALID_MODELS and model_lower != "auto":
