@@ -705,10 +705,8 @@ async def chat_completions(req: ChatCompletionRequest, account: Account = Depend
 
     # Debug logging
     if DEBUG_OPENAI_CONVERSION:
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info(f"[OpenAI Debug] Received request:\n{json.dumps(req.model_dump(), ensure_ascii=False, indent=2)}")
-        logger.info(f"[OpenAI Debug] Converted AWS Q request:\n{json.dumps(aq_request, ensure_ascii=False, indent=2)}")
+        print(f"[OpenAI Debug] Received request:\n{json.dumps(req.model_dump(), ensure_ascii=False, indent=2)}")
+        print(f"[OpenAI Debug] Converted AWS Q request:\n{json.dumps(aq_request, ensure_ascii=False, indent=2)}")
 
     async def _send_upstream() -> Tuple[Any, Any, Any]:
         """发送请求到 AWS Q"""
