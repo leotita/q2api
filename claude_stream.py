@@ -1,10 +1,20 @@
 import json
 import logging
-import importlib.util
 import uuid
-from pathlib import Path
 from typing import AsyncGenerator, Optional, Dict, Any, List, Set
+
 import tiktoken
+
+from claude_parser import (
+    build_message_start,
+    build_content_block_start,
+    build_content_block_delta,
+    build_content_block_stop,
+    build_ping,
+    build_message_stop,
+    build_tool_use_start,
+    build_tool_use_input_delta,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,40 +46,6 @@ def count_tokens(text: str) -> int:
     if not text or not ENCODING:
         return 0
     return len(ENCODING.encode(text))
-
-# ------------------------------------------------------------------------------
-# Dynamic Loader
-# ------------------------------------------------------------------------------
-
-def _load_claude_parser():
-    """Dynamically load claude_parser module."""
-    base_dir = Path(__file__).resolve().parent
-    spec = importlib.util.spec_from_file_location("v2_claude_parser", str(base_dir / "claude_parser.py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-try:
-    _parser = _load_claude_parser()
-    build_message_start = _parser.build_message_start
-    build_content_block_start = _parser.build_content_block_start
-    build_content_block_delta = _parser.build_content_block_delta
-    build_content_block_stop = _parser.build_content_block_stop
-    build_ping = _parser.build_ping
-    build_message_stop = _parser.build_message_stop
-    build_tool_use_start = _parser.build_tool_use_start
-    build_tool_use_input_delta = _parser.build_tool_use_input_delta
-except Exception as e:
-    logger.error(f"Failed to load claude_parser: {e}")
-    # Fallback definitions
-    def build_message_start(*args, **kwargs): return ""
-    def build_content_block_start(*args, **kwargs): return ""
-    def build_content_block_delta(*args, **kwargs): return ""
-    def build_content_block_stop(*args, **kwargs): return ""
-    def build_ping(*args, **kwargs): return ""
-    def build_message_stop(*args, **kwargs): return ""
-    def build_tool_use_start(*args, **kwargs): return ""
-    def build_tool_use_input_delta(*args, **kwargs): return ""
 
 class ClaudeStreamHandler:
     def __init__(self, model: str, input_tokens: int = 0, conversation_id: Optional[str] = None):

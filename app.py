@@ -1,36 +1,41 @@
-import os
+import asyncio
 import json
+import os
+import random
+import time
 import traceback
 import uuid
-import time
-import asyncio
-import importlib.util
-import random
-import secrets
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, List, Any, AsyncGenerator, Tuple
 
-from fastapi import FastAPI, Depends, HTTPException, Header, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, FileResponse
-from pydantic import BaseModel
-from dotenv import load_dotenv
 import httpx
 import tiktoken
+from dotenv import load_dotenv
+from fastapi import FastAPI, Depends, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 
-from db import init_db, close_db, row_to_dict
+from claude_converter import convert_claude_to_amazonq_request, map_model_name
+from claude_stream import ClaudeStreamHandler
+from claude_types import ClaudeRequest
+from db import init_db, close_db
+from http_client import create_client
+from replicate import send_chat_request
+from schemas import (
+    Account, AccountCreate, BatchAccountCreate, AccountUpdate,
+    AccountListResponse, AccountUsage, AccountUsageListResponse,
+    AuthStartBody, AuthStartResponse, AuthStatusDetailResponse, AuthClaimResponse,
+    AdminLoginRequest, AdminLoginResponse,
+    ChatCompletionRequest,
+    FeedAccountsResponse, TokenCountResponse, HealthResponse, DeleteResponse,
+)
+from token_refresh import refresh_account_token
 
 # ------------------------------------------------------------------------------
 # Tokenizer
 # ------------------------------------------------------------------------------
 
-try:
-    # cl100k_base is used by gpt-4, gpt-3.5-turbo, text-embedding-ada-002
-    ENCODING = tiktoken.get_encoding("cl100k_base")
-except Exception:
-    ENCODING = None
-
+ENCODING = tiktoken.get_encoding("cl100k_base")
 def count_tokens(text: str, apply_multiplier: bool = False) -> int:
     """Counts tokens with tiktoken."""
     if not text or not ENCODING:
@@ -43,10 +48,8 @@ def count_tokens(text: str, apply_multiplier: bool = False) -> int:
 # ------------------------------------------------------------------------------
 # Bootstrap
 # ------------------------------------------------------------------------------
-
+load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
-
-load_dotenv(BASE_DIR / ".env")
 
 app = FastAPI(title="v2 OpenAI-compatible Server (Amazon Q Backend)")
 
@@ -59,122 +62,10 @@ app.add_middleware(
 )
 
 # ------------------------------------------------------------------------------
-# Dynamic import of replicate.py to avoid package __init__ needs
-# ------------------------------------------------------------------------------
-
-def _load_replicate_module():
-    mod_path = BASE_DIR / "replicate.py"
-    spec = importlib.util.spec_from_file_location("v2_replicate", str(mod_path))
-    module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-    assert spec is not None and spec.loader is not None
-    spec.loader.exec_module(module)  # type: ignore[attr-defined]
-    return module
-
-_replicate = _load_replicate_module()
-send_chat_request = _replicate.send_chat_request
-
-# ------------------------------------------------------------------------------
-# Dynamic import of Claude modules
-# ------------------------------------------------------------------------------
-
-def _load_claude_modules():
-    # claude_types
-    spec_types = importlib.util.spec_from_file_location("v2_claude_types", str(BASE_DIR / "claude_types.py"))
-    mod_types = importlib.util.module_from_spec(spec_types)
-    spec_types.loader.exec_module(mod_types)
-    
-    # claude_converter
-    spec_conv = importlib.util.spec_from_file_location("v2_claude_converter", str(BASE_DIR / "claude_converter.py"))
-    mod_conv = importlib.util.module_from_spec(spec_conv)
-    # We need to inject claude_types into converter's namespace if it uses relative imports or expects them
-    # But since we used relative import in claude_converter.py (.claude_types), we need to be careful.
-    # Actually, since we are loading dynamically, relative imports might fail if not in sys.modules correctly.
-    # Let's patch sys.modules temporarily or just rely on file location.
-    # A simpler way for this single-file script style is to just load them.
-    # However, claude_converter does `from .claude_types import ...`
-    # To make that work, we should probably just use standard import if v2 is a package,
-    # but v2 is just a folder.
-    # Let's assume the user runs this with v2 in pythonpath or we just fix imports in the files.
-    # But I wrote `from .claude_types` in the file.
-    # Let's try to load it. If it fails, we might need to adjust.
-    # Actually, for simplicity in this `app.py` dynamic loading context,
-    # it is better if `claude_converter.py` used absolute import or we mock the package.
-    # BUT, let's try to just load them and see.
-    # To avoid relative import issues, I will inject the module into sys.modules
-    import sys
-    sys.modules["v2.claude_types"] = mod_types
-    
-    spec_conv.loader.exec_module(mod_conv)
-    
-    # claude_stream
-    spec_stream = importlib.util.spec_from_file_location("v2_claude_stream", str(BASE_DIR / "claude_stream.py"))
-    mod_stream = importlib.util.module_from_spec(spec_stream)
-    spec_stream.loader.exec_module(mod_stream)
-    
-    return mod_types, mod_conv, mod_stream
-
-try:
-    _claude_types, _claude_converter, _claude_stream = _load_claude_modules()
-    ClaudeRequest = _claude_types.ClaudeRequest
-    convert_claude_to_amazonq_request = _claude_converter.convert_claude_to_amazonq_request
-    map_model_name = _claude_converter.map_model_name
-    ClaudeStreamHandler = _claude_stream.ClaudeStreamHandler
-except Exception as e:
-    print(f"Failed to load Claude modules: {e}")
-    traceback.print_exc()
-    # Define dummy classes to avoid NameError on startup if loading fails
-    class ClaudeRequest(BaseModel):
-        pass
-    convert_claude_to_amazonq_request = None
-    map_model_name = lambda m: m  # Pass through if module fails to load
-    ClaudeStreamHandler = None
-
-# ------------------------------------------------------------------------------
 # Global HTTP Client
 # ------------------------------------------------------------------------------
 
 GLOBAL_CLIENT: Optional[httpx.AsyncClient] = None
-
-def _get_proxies() -> Optional[Dict[str, str]]:
-    proxy = os.getenv("HTTP_PROXY", "").strip()
-    if proxy:
-        return {"http": proxy, "https": proxy}
-    return None
-
-async def _init_global_client():
-    global GLOBAL_CLIENT
-    proxies = _get_proxies()
-    mounts = None
-    if proxies:
-        proxy_url = proxies.get("https") or proxies.get("http")
-        if proxy_url:
-            mounts = {
-                "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-                "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-            }
-    # Increased limits for high concurrency with streaming
-    # max_connections: 总连接数上限
-    # max_keepalive_connections: 保持活跃的连接数
-    # keepalive_expiry: 连接保持时间
-    limits = httpx.Limits(
-        max_keepalive_connections=60,
-        max_connections=60,  # 提高到500以支持更高并发
-        keepalive_expiry=30.0  # 30秒后释放空闲连接
-    )
-    # 为流式响应设置更长的超时
-    timeout = httpx.Timeout(
-        connect=1.0,  # 连接超时
-        read=300.0,    # 读取超时(流式响应需要更长时间)
-        write=1.0,    # 写入超时
-        pool=1.0      # 从连接池获取连接的超时时间(关键!)
-    )
-    GLOBAL_CLIENT = httpx.AsyncClient(mounts=mounts, timeout=timeout, limits=limits)
-
-async def _close_global_client():
-    global GLOBAL_CLIENT
-    if GLOBAL_CLIENT:
-        await GLOBAL_CLIENT.aclose()
-        GLOBAL_CLIENT = None
 
 # ------------------------------------------------------------------------------
 # Database helpers
@@ -183,16 +74,6 @@ async def _close_global_client():
 # Database backend instance (initialized on startup)
 _db = None
 
-async def _ensure_db():
-    """Initialize database backend."""
-    global _db
-    _db = await init_db()
-
-def _row_to_dict(r: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert database row to dict with JSON parsing."""
-    return row_to_dict(r)
-
-# _ensure_db() will be called in startup event
 
 # ------------------------------------------------------------------------------
 # Background token refresh thread
@@ -231,10 +112,10 @@ async def _refresh_stale_tokens():
 
                 if should_refresh:
                     try:
-                        await refresh_access_token_in_db(acc_id)
+                        acc = await get_account(acc_id)
+                        await refresh_account_in_db(acc)
                     except Exception:
                         traceback.print_exc()
-                        # Ignore per-account refresh failure; timestamp/status are recorded inside
                         pass
         except Exception:
             traceback.print_exc()
@@ -251,10 +132,7 @@ def _parse_allowed_keys_env() -> List[str]:
     - When empty or unset, authorization is effectively disabled (dev mode).
     """
     s = os.getenv("OPENAI_KEYS", "") or ""
-    keys: List[str] = []
-    for k in [x.strip() for x in s.split(",") if x.strip()]:
-        keys.append(k)
-    return keys
+    return [x.strip() for x in s.split(",") if x.strip()]
 
 ALLOWED_API_KEYS: List[str] = _parse_allowed_keys_env()
 MAX_ERROR_COUNT: int = int(os.getenv("MAX_ERROR_COUNT", "100"))
@@ -292,7 +170,7 @@ def _extract_bearer(token_header: Optional[str]) -> Optional[str]:
         return token_header.split(" ", 1)[1].strip()
     return token_header.strip()
 
-async def _list_enabled_accounts(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+async def _list_enabled_accounts(limit: Optional[int] = None) -> List[Account]:
     if LAZY_ACCOUNT_POOL_ENABLED:
         order_direction = "DESC" if LAZY_ACCOUNT_POOL_ORDER_DESC else "ASC"
         query = f"SELECT * FROM accounts WHERE enabled=1 ORDER BY {LAZY_ACCOUNT_POOL_ORDER_BY} {order_direction}"
@@ -304,16 +182,16 @@ async def _list_enabled_accounts(limit: Optional[int] = None) -> List[Dict[str, 
         if limit:
             query += f" LIMIT {limit}"
         rows = await _db.fetchall(query)
-    return [_row_to_dict(r) for r in rows]
+    return [Account.from_row(r) for r in rows]
 
-async def _list_disabled_accounts() -> List[Dict[str, Any]]:
+async def _list_disabled_accounts() -> List[Account]:
     rows = await _db.fetchall("SELECT * FROM accounts WHERE enabled=0 ORDER BY created_at DESC")
-    return [_row_to_dict(r) for r in rows]
+    return [Account.from_row(r) for r in rows]
 
-async def verify_account(account: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+async def verify_account(account: Account) -> Tuple[bool, Optional[str]]:
     """验证账号可用性"""
     try:
-        account = await refresh_access_token_in_db(account['id'])
+        account = await refresh_account_in_db(account)
         test_request = {
             "conversationState": {
                 "currentMessage": {"userInputMessage": {"content": "hello"}},
@@ -321,7 +199,7 @@ async def verify_account(account: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
             }
         }
         _, _, tracker, event_gen = await send_chat_request(
-            access_token=account['accessToken'],
+            access_token=account.accessToken,
             messages=[],
             stream=True,
             raw_payload=test_request
@@ -335,7 +213,7 @@ async def verify_account(account: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
             return False, "AccessDenied"
         return False, None
 
-async def resolve_account_for_key(bearer_key: Optional[str], exclude_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+async def resolve_account_for_key(bearer_key: Optional[str], exclude_ids: Optional[List[str]] = None) -> Account:
     """
     Authorize request by OPENAI_KEYS (if configured), then select an AWS account.
     Selection strategy: weighted random based on error rate (lower error rate = higher probability).
@@ -354,154 +232,51 @@ async def resolve_account_for_key(bearer_key: Optional[str], exclude_ids: Option
 
     # Exclude specified accounts (for retry)
     if exclude_ids:
-        candidates = [acc for acc in candidates if acc.get("id") not in exclude_ids]
+        candidates = [acc for acc in candidates if acc.id not in exclude_ids]
 
     if not candidates:
         raise HTTPException(status_code=401, detail="No enabled account available")
 
     # Weighted random selection: lower error rate = higher weight
-    def get_weight(acc):
-        total = acc.get("success_count", 0) + acc.get("error_count", 0)
+    def get_weight(acc: Account):
+        total = acc.success_count + acc.error_count
         if total == 0:
             return 0.5  # 新账号中等权重
-        error_rate = acc.get("error_count", 0) / total
+        error_rate = acc.error_count / total
         return max(0.1, 1 - error_rate)  # 最低0.1，保证都有机会
 
     weights = [get_weight(acc) for acc in candidates]
     return random.choices(candidates, weights=weights, k=1)[0]
 
 # ------------------------------------------------------------------------------
-# Pydantic Schemas
+# Token refresh
 # ------------------------------------------------------------------------------
 
-class AccountCreate(BaseModel):
-    label: Optional[str] = None
-    clientId: str
-    clientSecret: str
-    refreshToken: Optional[str] = None
-    accessToken: Optional[str] = None
-    other: Optional[Dict[str, Any]] = None
-    enabled: Optional[bool] = True
-
-class BatchAccountCreate(BaseModel):
-    accounts: List[AccountCreate]
-
-class AccountUpdate(BaseModel):
-    label: Optional[str] = None
-    clientId: Optional[str] = None
-    clientSecret: Optional[str] = None
-    refreshToken: Optional[str] = None
-    accessToken: Optional[str] = None
-    other: Optional[Dict[str, Any]] = None
-    enabled: Optional[bool] = None
-
-class ChatMessage(BaseModel):
-    role: str
-    content: Any
-
-class ChatCompletionRequest(BaseModel):
-    model: Optional[str] = None
-    messages: List[ChatMessage]
-    stream: Optional[bool] = False
-
-# ------------------------------------------------------------------------------
-# Token refresh (OIDC)
-# ------------------------------------------------------------------------------
-
-OIDC_BASE = "https://oidc.us-east-1.amazonaws.com"
-TOKEN_URL = f"{OIDC_BASE}/token"
-
-def _oidc_headers() -> Dict[str, str]:
-    return {
-        "content-type": "application/json",
-        "user-agent": "aws-sdk-rust/1.3.9 os/windows lang/rust/1.87.0",
-        "x-amz-user-agent": "aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os/windows lang/rust/1.87.0 m/E app/AmazonQ-For-CLI",
-        "amz-sdk-request": "attempt=1; max=3",
-        "amz-sdk-invocation-id": str(uuid.uuid4()),
-    }
-
-async def refresh_access_token_in_db(account_id: str) -> Dict[str, Any]:
+async def get_account(account_id: str) -> Account:
     row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (account_id,))
     if not row:
         raise HTTPException(status_code=404, detail="Account not found")
-    acc = _row_to_dict(row)
+    return Account.from_row(row)
 
-    if not acc.get("clientId") or not acc.get("clientSecret") or not acc.get("refreshToken"):
-        raise HTTPException(status_code=400, detail="Account missing clientId/clientSecret/refreshToken for refresh")
-
-    payload = {
-        "grantType": "refresh_token",
-        "clientId": acc["clientId"],
-        "clientSecret": acc["clientSecret"],
-        "refreshToken": acc["refreshToken"],
-    }
-
+async def refresh_account_in_db(account: Account) -> Account:
+    """刷新账号 token 并更新数据库"""
     try:
-        # Use global client if available, else fallback (though global should be ready)
-        client = GLOBAL_CLIENT
-        if not client:
-            # Fallback for safety
-            async with httpx.AsyncClient(timeout=60.0) as temp_client:
-                r = await temp_client.post(TOKEN_URL, headers=_oidc_headers(), json=payload)
-                r.raise_for_status()
-                data = r.json()
-        else:
-            r = await client.post(TOKEN_URL, headers=_oidc_headers(), json=payload)
-            r.raise_for_status()
-            data = r.json()
-
-        new_access = data.get("accessToken")
-        new_refresh = data.get("refreshToken", acc.get("refreshToken"))
+        new_access, new_refresh = await refresh_account_token(account, GLOBAL_CLIENT)
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-        status = "success"
-    except httpx.HTTPError as e:
-        now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-        status = "failed"
         await _db.execute(
-            """
-            UPDATE accounts
-            SET last_refresh_time=?, last_refresh_status=?, updated_at=?
-            WHERE id=?
-            """,
-            (now, status, now, account_id),
+            "UPDATE accounts SET accessToken=?, refreshToken=?, last_refresh_time=?, last_refresh_status=?, updated_at=? WHERE id=?",
+            (new_access, new_refresh, now, "success", now, account.id),
         )
-        # 记录刷新失败次数
-        await _update_stats(account_id, False)
-        raise HTTPException(status_code=502, detail=f"Token refresh failed: {str(e)}")
-    except Exception as e:
-        # Ensure last_refresh_time is recorded even on unexpected errors
+        return await get_account(account.id)
+    except Exception:
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-        status = "failed"
         await _db.execute(
-            """
-            UPDATE accounts
-            SET last_refresh_time=?, last_refresh_status=?, updated_at=?
-            WHERE id=?
-            """,
-            (now, status, now, account_id),
+            "UPDATE accounts SET last_refresh_time=?, last_refresh_status=?, updated_at=? WHERE id=?",
+            (now, "failed", now, account.id),
         )
-        # 记录刷新失败次数
-        await _update_stats(account_id, False)
         raise
 
-    await _db.execute(
-        """
-        UPDATE accounts
-        SET accessToken=?, refreshToken=?, last_refresh_time=?, last_refresh_status=?, updated_at=?
-        WHERE id=?
-        """,
-        (new_access, new_refresh, now, status, now, account_id),
-    )
-
-    row2 = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (account_id,))
-    return _row_to_dict(row2)
-
-async def get_account(account_id: str) -> Dict[str, Any]:
-    row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (account_id,))
-    if not row:
-        raise HTTPException(status_code=404, detail="Account not found")
-    return _row_to_dict(row)
-
+#todo 待优化错误次数统计 现在是连续错误次数才算
 async def _update_stats(account_id: str, success: bool) -> None:
     if success:
         await _db.execute("UPDATE accounts SET success_count=success_count+1, error_count=0, updated_at=? WHERE id=?",
@@ -546,41 +321,14 @@ def verify_admin_password(authorization: Optional[str] = Header(None)) -> bool:
 
     return True
 
-# ------------------------------------------------------------------------------
-# OpenAI-compatible Chat endpoint
-# ------------------------------------------------------------------------------
 
-def _openai_non_streaming_response(
-    text: str,
-    model: Optional[str],
-    prompt_tokens: int = 0,
-    completion_tokens: int = 0,
-) -> Dict[str, Any]:
-    created = int(time.time())
-    return {
-        "id": f"chatcmpl-{uuid.uuid4()}",
-        "object": "chat.completion",
-        "created": created,
-        "model": model or "unknown",
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": text,
-                },
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
-    }
 
 def _sse_format(obj: Dict[str, Any]) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+# ------------------------------------------------------------------------------
+# claude-compatible Chat endpoint
+# ------------------------------------------------------------------------------
 
 @app.post("/v1/messages")
 async def claude_messages(
@@ -670,12 +418,12 @@ async def claude_messages(
                     account = await resolve_account_for_key(bearer_key, exclude_ids=None)
                 else:
                     raise
-            tried_account_ids.append(account["id"])
+            tried_account_ids.append(account.id)
 
-            access = account.get("accessToken")
+            access = account.accessToken
             if not access:
-                refreshed = await refresh_access_token_in_db(account["id"])
-                access = refreshed.get("accessToken")
+                refreshed = await refresh_account_in_db(account)
+                access = refreshed.accessToken
 
             # Send request
             _, _, tracker, event_iter = await send_chat_request(
@@ -715,11 +463,11 @@ async def claude_messages(
                             yield sse
                     async for sse in handler.finish():
                         yield sse
-                    await _update_stats(current_account["id"], True)
+                    await _update_stats(current_account.id, True)
                 except GeneratorExit:
-                    await _update_stats(current_account["id"], current_tracker.has_content if current_tracker else False)
+                    await _update_stats(current_account.id, current_tracker.has_content if current_tracker else False)
                 except Exception:
-                    await _update_stats(current_account["id"], False)
+                    await _update_stats(current_account.id, False)
                     raise
 
             if req.stream:
@@ -801,7 +549,7 @@ async def claude_messages(
         except HTTPException:
             # Don't retry on HTTP exceptions (auth errors, etc.)
             if account:
-                await _update_stats(account["id"], False)
+                await _update_stats(account.id, False)
             raise
         except Exception as e:
             # Close event_iter if exists
@@ -811,7 +559,7 @@ async def claude_messages(
                 except Exception:
                     pass
             if account:
-                await _update_stats(account["id"], False)
+                await _update_stats(account.id, False)
 
             # Check for non-retryable errors
             error_str = str(e)
@@ -833,8 +581,8 @@ async def claude_messages(
                 # All retries exhausted
                 raise HTTPException(status_code=502, detail=f"All {max_attempts} attempts failed. Last error: {str(last_error)}")
 
-@app.post("/v1/messages/count_tokens")
-async def count_tokens_endpoint(req: ClaudeRequest):
+@app.post("/v1/messages/count_tokens", response_model=TokenCountResponse)
+async def count_tokens_endpoint(req: ClaudeRequest) -> TokenCountResponse:
     """
     Count tokens in a message without sending it.
     Compatible with Claude API's /v1/messages/count_tokens endpoint.
@@ -865,11 +613,46 @@ async def count_tokens_endpoint(req: ClaudeRequest):
         text_to_count += json.dumps([tool.model_dump() if hasattr(tool, 'model_dump') else tool for tool in req.tools], ensure_ascii=False)
     
     input_tokens = count_tokens(text_to_count, apply_multiplier=True)
-    
-    return {"input_tokens": input_tokens}
+
+    return TokenCountResponse(input_tokens=input_tokens)
+
+
+# ------------------------------------------------------------------------------
+# OpenAI-compatible Chat endpoint
+# ------------------------------------------------------------------------------
+
+def _openai_non_streaming_response(
+        text: str,
+        model: Optional[str],
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+) -> Dict[str, Any]:
+    created = int(time.time())
+    return {
+        "id": f"chatcmpl-{uuid.uuid4()}",
+        "object": "chat.completion",
+        "created": created,
+        "model": model or "unknown",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": text,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] = Depends(require_account)):
+async def chat_completions(req: ChatCompletionRequest, account: Account = Depends(require_account)):
     """
     OpenAI-compatible chat endpoint.
     - stream default False
@@ -880,10 +663,10 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
     do_stream = bool(req.stream)
 
     async def _send_upstream(stream: bool) -> Tuple[Optional[str], Optional[AsyncGenerator[str, None]], Any]:
-        access = account.get("accessToken")
+        access = account.accessToken
         if not access:
-            refreshed = await refresh_access_token_in_db(account["id"])
-            access = refreshed.get("accessToken")
+            refreshed = await refresh_account_in_db(account)
+            access = refreshed.accessToken
             if not access:
                 raise HTTPException(status_code=502, detail="Access token unavailable after refresh")
         # Note: send_chat_request signature changed, but we use keyword args so it should be fine if we don't pass raw_payload
@@ -899,10 +682,10 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
             prompt_tokens = count_tokens(prompt_text)
 
             text, _, tracker = await _send_upstream(stream=False)
-            await _update_stats(account["id"], bool(text))
-            
+            await _update_stats(account.id, bool(text))
+
             completion_tokens = count_tokens(text or "")
-            
+
             return JSONResponse(content=_openai_non_streaming_response(
                 text or "",
                 model,
@@ -910,7 +693,7 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
                 completion_tokens=completion_tokens
             ))
         except Exception as e:
-            await _update_stats(account["id"], False)
+            await _update_stats(account.id, False)
             raise
     else:
         created = int(time.time())
@@ -966,12 +749,12 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
                     })
                     
                     yield "data: [DONE]\n\n"
-                    await _update_stats(account["id"], True)
+                    await _update_stats(account.id, True)
                 except GeneratorExit:
                     # Client disconnected - update stats but don't re-raise
-                    await _update_stats(account["id"], tracker.has_content if tracker else False)
+                    await _update_stats(account.id, tracker.has_content if tracker else False)
                 except Exception:
-                    await _update_stats(account["id"], tracker.has_content if tracker else False)
+                    await _update_stats(account.id, tracker.has_content if tracker else False)
                     raise
             
             return StreamingResponse(event_gen(), media_type="text/event-stream")
@@ -982,40 +765,17 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
                     await it.aclose()
             except Exception:
                 pass
-            await _update_stats(account["id"], False)
+            await _update_stats(account.id, False)
             raise
 
 # ------------------------------------------------------------------------------
 # Device Authorization (URL Login, 5-minute timeout)
 # ------------------------------------------------------------------------------
 
-# Dynamic import of auth_flow.py (device-code login helpers)
-def _load_auth_flow_module():
-    mod_path = BASE_DIR / "auth_flow.py"
-    spec = importlib.util.spec_from_file_location("v2_auth_flow", str(mod_path))
-    module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-    assert spec is not None and spec.loader is not None
-    spec.loader.exec_module(module)  # type: ignore[attr-defined]
-    return module
-
-_auth_flow = _load_auth_flow_module()
-register_client_min = _auth_flow.register_client_min
-device_authorize = _auth_flow.device_authorize
-poll_token_device_code = _auth_flow.poll_token_device_code
+from auth_flow import register_client_min, device_authorize, poll_token_device_code
 
 # In-memory auth sessions (ephemeral)
 AUTH_SESSIONS: Dict[str, Dict[str, Any]] = {}
-
-class AuthStartBody(BaseModel):
-    label: Optional[str] = None
-    enabled: Optional[bool] = True
-
-class AdminLoginRequest(BaseModel):
-    password: str
-
-class AdminLoginResponse(BaseModel):
-    success: bool
-    message: str
 
 async def _create_account_from_tokens(
     client_id: str,
@@ -1024,7 +784,7 @@ async def _create_account_from_tokens(
     refresh_token: Optional[str],
     label: Optional[str],
     enabled: bool,
-) -> Dict[str, Any]:
+) -> Account:
     now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
     acc_id = str(uuid.uuid4())
     await _db.execute(
@@ -1047,8 +807,7 @@ async def _create_account_from_tokens(
             1 if enabled else 0,
         ),
     )
-    row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (acc_id,))
-    return _row_to_dict(row)
+    return await get_account(acc_id)
 
 # 管理控制台相关端点 - 仅在启用时注册
 if CONSOLE_ENABLED:
@@ -1111,8 +870,8 @@ if CONSOLE_ENABLED:
     # Device Authorization Endpoints
     # ------------------------------------------------------------------------------
 
-    @app.post("/v2/auth/start")
-    async def auth_start(body: AuthStartBody, _: bool = Depends(verify_admin_password)):
+    @app.post("/v2/auth/start", response_model=AuthStartResponse)
+    async def auth_start(body: AuthStartBody, _: bool = Depends(verify_admin_password)) -> AuthStartResponse:
         """
         Start device authorization and return verification URL for user login.
         Session lifetime capped at 5 minutes on claim.
@@ -1140,31 +899,31 @@ if CONSOLE_ENABLED:
             "accountId": None,
         }
         AUTH_SESSIONS[auth_id] = sess
-        return {
-            "authId": auth_id,
-            "verificationUriComplete": sess["verificationUriComplete"],
-            "userCode": sess["userCode"],
-            "expiresIn": sess["expiresIn"],
-            "interval": sess["interval"],
-        }
+        return AuthStartResponse(
+            authId=auth_id,
+            verificationUriComplete=sess["verificationUriComplete"],
+            userCode=sess["userCode"],
+            expiresIn=sess["expiresIn"],
+            interval=sess["interval"],
+        )
 
-    @app.get("/v2/auth/status/{auth_id}")
-    async def auth_status(auth_id: str, _: bool = Depends(verify_admin_password)):
+    @app.get("/v2/auth/status/{auth_id}", response_model=AuthStatusDetailResponse)
+    async def auth_status(auth_id: str, _: bool = Depends(verify_admin_password)) -> AuthStatusDetailResponse:
         sess = AUTH_SESSIONS.get(auth_id)
         if not sess:
             raise HTTPException(status_code=404, detail="Auth session not found")
         now_ts = int(time.time())
         deadline = sess["startTime"] + min(int(sess.get("expiresIn", 600)), 300)
         remaining = max(0, deadline - now_ts)
-        return {
-            "status": sess.get("status"),
-            "remaining": remaining,
-            "error": sess.get("error"),
-            "accountId": sess.get("accountId"),
-        }
+        return AuthStatusDetailResponse(
+            status=sess.get("status"),
+            remaining=remaining,
+            error=sess.get("error"),
+            accountId=sess.get("accountId"),
+        )
 
-    @app.post("/v2/auth/claim/{auth_id}")
-    async def auth_claim(auth_id: str, _: bool = Depends(verify_admin_password)):
+    @app.post("/v2/auth/claim/{auth_id}", response_model=AuthClaimResponse)
+    async def auth_claim(auth_id: str, _: bool = Depends(verify_admin_password)) -> AuthClaimResponse:
         """
         Block up to 5 minutes to exchange the device code for tokens after user completed login.
         On success, creates an enabled account and returns it.
@@ -1173,11 +932,11 @@ if CONSOLE_ENABLED:
         if not sess:
             raise HTTPException(status_code=404, detail="Auth session not found")
         if sess.get("status") in ("completed", "timeout", "error"):
-            return {
-                "status": sess["status"],
-                "accountId": sess.get("accountId"),
-                "error": sess.get("error"),
-            }
+            return AuthClaimResponse(
+                status=sess["status"],
+                accountId=sess.get("accountId"),
+                error=sess.get("error"),
+            )
         try:
             toks = await poll_token_device_code(
                 sess["clientId"],
@@ -1201,11 +960,11 @@ if CONSOLE_ENABLED:
                 sess.get("enabled", True),
             )
             sess["status"] = "completed"
-            sess["accountId"] = acc["id"]
-            return {
-                "status": "completed",
-                "account": acc,
-            }
+            sess["accountId"] = acc.id
+            return AuthClaimResponse(
+                status="completed",
+                account=acc,
+            )
         except TimeoutError:
             sess["status"] = "timeout"
             raise HTTPException(status_code=408, detail="Authorization timeout (5 minutes)")
@@ -1218,8 +977,8 @@ if CONSOLE_ENABLED:
     # Accounts Management API
     # ------------------------------------------------------------------------------
 
-    @app.post("/v2/accounts")
-    async def create_account(body: AccountCreate, _: bool = Depends(verify_admin_password)):
+    @app.post("/v2/accounts", response_model=Account)
+    async def create_account(body: AccountCreate, _: bool = Depends(verify_admin_password)) -> Account:
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         acc_id = str(uuid.uuid4())
         other_str = json.dumps(body.other, ensure_ascii=False) if body.other is not None else None
@@ -1244,8 +1003,7 @@ if CONSOLE_ENABLED:
                 enabled_val,
             ),
         )
-        row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (acc_id,))
-        return _row_to_dict(row)
+        return await get_account(acc_id)
 
 
     async def _verify_and_enable_accounts(account_ids: List[str]):
@@ -1260,15 +1018,15 @@ if CONSOLE_ENABLED:
                 if verify_success:
                     await _db.execute("UPDATE accounts SET enabled=1, updated_at=? WHERE id=?", (now, acc_id))
                 elif fail_reason:
-                    other_dict = account.get("other", {}) or {}
+                    other_dict = json.loads(account.other) if account.other else {}
                     other_dict['failedReason'] = fail_reason
                     await _db.execute("UPDATE accounts SET other=?, updated_at=? WHERE id=?", (json.dumps(other_dict, ensure_ascii=False), now, acc_id))
             except Exception as e:
                 print(f"Error verifying account {acc_id}: {e}")
                 traceback.print_exc()
 
-    @app.post("/v2/accounts/feed")
-    async def create_accounts_feed(request: BatchAccountCreate, _: bool = Depends(verify_admin_password)):
+    @app.post("/v2/accounts/feed", response_model=FeedAccountsResponse)
+    async def create_accounts_feed(request: BatchAccountCreate, _: bool = Depends(verify_admin_password)) -> FeedAccountsResponse:
         """
         统一的投喂接口，接收账号列表，立即存入并后台异步验证。
         """
@@ -1307,14 +1065,14 @@ if CONSOLE_ENABLED:
         if new_account_ids:
             asyncio.create_task(_verify_and_enable_accounts(new_account_ids))
 
-        return {
-            "status": "processing",
-            "message": f"{len(new_account_ids)} accounts received and are being verified in the background.",
-            "account_ids": new_account_ids
-        }
+        return FeedAccountsResponse(
+            status="processing",
+            message=f"{len(new_account_ids)} accounts received and are being verified in the background.",
+            account_ids=new_account_ids
+        )
 
-    @app.get("/v2/accounts")
-    async def list_accounts(_: bool = Depends(verify_admin_password), enabled: Optional[bool] = None, sort_by: str = "created_at", sort_order: str = "desc"):
+    @app.get("/v2/accounts", response_model=AccountListResponse)
+    async def list_accounts(_: bool = Depends(verify_admin_password), enabled: Optional[bool] = None, sort_by: str = "created_at", sort_order: str = "desc") -> AccountListResponse:
         query = "SELECT * FROM accounts"
         params = []
         if enabled is not None:
@@ -1324,8 +1082,8 @@ if CONSOLE_ENABLED:
         order = "DESC" if sort_order.lower() == "desc" else "ASC"
         query += f" ORDER BY {sort_field} {order}"
         rows = await _db.fetchall(query, tuple(params) if params else ())
-        accounts = [_row_to_dict(r) for r in rows]
-        return {"accounts": accounts, "count": len(accounts)}
+        accounts = [Account.from_row(r) for r in rows]
+        return AccountListResponse(accounts=accounts, count=len(accounts))
 
     # ------------------------------------------------------------------------------
     # Usage Query
@@ -1333,11 +1091,11 @@ if CONSOLE_ENABLED:
 
     USAGE_LIMITS_URL = "https://q.{region}.amazonaws.com/getUsageLimits"
 
-    async def _get_account_usage(account: Dict[str, Any], client: httpx.AsyncClient) -> Dict[str, Any]:
+    async def _get_account_usage(account: Account, client: httpx.AsyncClient) -> Dict[str, Any]:
         """获取单个账号的使用量"""
-        result = {"account_id": account["id"], "label": account.get("label", ""), "success": False, "usage": None, "error": None}
+        result = {"account_id": account.id, "label": account.label or "", "success": False, "usage": None, "error": None}
 
-        access_token = account.get("accessToken")
+        access_token = account.accessToken
         if not access_token:
             result["error"] = "无访问令牌"
             return result
@@ -1363,44 +1121,45 @@ if CONSOLE_ENABLED:
 
         return result
 
-    @app.get("/v2/accounts/usage")
-    async def get_all_accounts_usage(_: bool = Depends(verify_admin_password)):
+    @app.get("/v2/accounts/usage", response_model=AccountUsageListResponse)
+    async def get_all_accounts_usage(_: bool = Depends(verify_admin_password)) -> AccountUsageListResponse:
         """查询所有启用账号的使用量"""
         rows = await _db.fetchall("SELECT * FROM accounts WHERE enabled=1 ORDER BY created_at DESC")
-        accounts = [_row_to_dict(r) for r in rows]
+        accounts = [Account.from_row(r) for r in rows]
 
         if not accounts:
-            return {"results": [], "total": 0, "success_count": 0}
+            return AccountUsageListResponse(results=[], total=0, success_count=0)
 
         results = []
-        async with httpx.AsyncClient() as client:
+        async with create_client(timeout=30.0) as client:
             tasks = [_get_account_usage(acc, client) for acc in accounts]
-            results = await asyncio.gather(*tasks)
+            raw_results = await asyncio.gather(*tasks)
+            results = [AccountUsage(**r) for r in raw_results]
 
-        success_count = sum(1 for r in results if r["success"])
-        return {"results": results, "total": len(results), "success_count": success_count}
+        success_count = sum(1 for r in results if r.success)
+        return AccountUsageListResponse(results=results, total=len(results), success_count=success_count)
 
-    @app.get("/v2/accounts/{account_id}/usage")
-    async def get_single_account_usage(account_id: str, _: bool = Depends(verify_admin_password)):
+    @app.get("/v2/accounts/{account_id}/usage", response_model=AccountUsage)
+    async def get_single_account_usage(account_id: str, _: bool = Depends(verify_admin_password)) -> AccountUsage:
         """查询单个账号的使用量"""
         account = await get_account(account_id)
-        async with httpx.AsyncClient() as client:
+        async with create_client(timeout=30.0) as client:
             result = await _get_account_usage(account, client)
-        return result
+        return AccountUsage(**result)
 
-    @app.get("/v2/accounts/{account_id}")
-    async def get_account_detail(account_id: str, _: bool = Depends(verify_admin_password)):
+    @app.get("/v2/accounts/{account_id}", response_model=Account)
+    async def get_account_detail(account_id: str, _: bool = Depends(verify_admin_password)) -> Account:
         return await get_account(account_id)
 
-    @app.delete("/v2/accounts/{account_id}")
-    async def delete_account(account_id: str, _: bool = Depends(verify_admin_password)):
+    @app.delete("/v2/accounts/{account_id}", response_model=DeleteResponse)
+    async def delete_account(account_id: str, _: bool = Depends(verify_admin_password)) -> DeleteResponse:
         rowcount = await _db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
         if rowcount == 0:
             raise HTTPException(status_code=404, detail="Account not found")
-        return {"deleted": account_id}
+        return DeleteResponse(deleted=account_id)
 
-    @app.patch("/v2/accounts/{account_id}")
-    async def update_account(account_id: str, body: AccountUpdate, _: bool = Depends(verify_admin_password)):
+    @app.patch("/v2/accounts/{account_id}", response_model=Account)
+    async def update_account(account_id: str, body: AccountUpdate, _: bool = Depends(verify_admin_password)) -> Account:
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         fields = []
         values: List[Any] = []
@@ -1430,11 +1189,17 @@ if CONSOLE_ENABLED:
         if rowcount == 0:
             raise HTTPException(status_code=404, detail="Account not found")
         row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (account_id,))
-        return _row_to_dict(row)
+        return Account.from_row(row)
 
-    @app.post("/v2/accounts/{account_id}/refresh")
-    async def manual_refresh(account_id: str, _: bool = Depends(verify_admin_password)):
-        return await refresh_access_token_in_db(account_id)
+    @app.post("/v2/accounts/{account_id}/refresh", response_model=Account)
+    async def manual_refresh(account_id: str, _: bool = Depends(verify_admin_password)) -> Account:
+        try:
+            account = await get_account(account_id)
+            return await refresh_account_in_db(account)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"Token refresh failed: {str(e)}")
 
     # ------------------------------------------------------------------------------
     # Simple Frontend (minimal dev test page; full UI in v2/frontend/index.html)
@@ -1456,9 +1221,9 @@ if CONSOLE_ENABLED:
 # Health
 # ------------------------------------------------------------------------------
 
-@app.get("/healthz")
-async def health():
-    return {"status": "ok"}
+@app.get("/healthz", response_model=HealthResponse)
+async def health() -> HealthResponse:
+    return HealthResponse(status="ok")
 
 # ------------------------------------------------------------------------------
 # Startup / Shutdown Events
@@ -1504,12 +1269,21 @@ async def health():
 @app.on_event("startup")
 async def startup_event():
     """Initialize database and start background tasks on startup."""
-    await _init_global_client()
-    await _ensure_db()
+    global GLOBAL_CLIENT, _db
+    GLOBAL_CLIENT = create_client(
+        timeout=1.0,
+        read_timeout=300.0,
+        connect_timeout=1.0,
+        max_connections=60,
+        keepalive_expiry=30.0
+    )
+    _db = await init_db()
     asyncio.create_task(_refresh_stale_tokens())
-    # asyncio.create_task(_verify_disabled_accounts_loop())
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    await _close_global_client()
+    global GLOBAL_CLIENT
+    if GLOBAL_CLIENT:
+        await GLOBAL_CLIENT.aclose()
+        GLOBAL_CLIENT = None
     await close_db()

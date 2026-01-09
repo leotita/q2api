@@ -1,30 +1,16 @@
-import json
-import uuid
-import os
 import asyncio
+import json
+import struct
+import uuid
 import weakref
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Iterator, List, AsyncGenerator, Any
-import struct
+from typing import Dict, Optional, Tuple, List, AsyncGenerator, Any
+
 import httpx
-import importlib.util
 
-def _load_claude_parser():
-    """Dynamically load claude_parser module."""
-    base_dir = Path(__file__).resolve().parent
-    spec = importlib.util.spec_from_file_location("v2_claude_parser", str(base_dir / "claude_parser.py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from claude_parser import EventStreamParser, extract_event_info
+from http_client import create_client
 
-try:
-    _parser = _load_claude_parser()
-    EventStreamParser = _parser.EventStreamParser
-    extract_event_info = _parser.extract_event_info
-except Exception as e:
-    print(f"Warning: Failed to load claude_parser: {e}")
-    EventStreamParser = None
-    extract_event_info = None
 
 class StreamTracker:
     def __init__(self):
@@ -35,12 +21,6 @@ class StreamTracker:
             if item:
                 self.has_content = True
             yield item
-
-def _get_proxies() -> Optional[Dict[str, str]]:
-    proxy = os.getenv("HTTP_PROXY", "").strip()
-    if proxy:
-        return {"http": proxy, "https": proxy}
-    return None
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = BASE_DIR / "templates" / "streaming_request.json"
@@ -242,21 +222,12 @@ async def send_chat_request(
 
     payload_str = json.dumps(body_json, ensure_ascii=False)
     headers = _merge_headers(headers_from_log, access_token)
-    
+
     local_client = False
     if client is None:
         local_client = True
-        proxies = _get_proxies()
-        mounts = None
-        if proxies:
-            proxy_url = proxies.get("https") or proxies.get("http")
-            if proxy_url:
-                mounts = {
-                    "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-                    "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-                }
-        client = httpx.AsyncClient(mounts=mounts, timeout=httpx.Timeout(timeout[0], read=timeout[1]))
-    
+        client = create_client(timeout=float(timeout[0]), read_timeout=float(timeout[1]))
+
     # Use manual request sending to control stream lifetime
     req = client.build_request("POST", url, headers=headers, content=payload_str)
     

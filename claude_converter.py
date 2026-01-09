@@ -1,26 +1,10 @@
 import json
-import uuid
-import time
 import logging
+import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Union
 
-try:
-    from .claude_types import ClaudeRequest, ClaudeMessage, ClaudeTool
-except ImportError:
-    # Fallback for dynamic loading where relative import might fail
-    # We assume claude_types is available in sys.modules or we can import it directly if in same dir
-    import sys
-    if "v2.claude_types" in sys.modules:
-        from v2.claude_types import ClaudeRequest, ClaudeMessage, ClaudeTool
-    else:
-        # Try absolute import assuming v2 is in path or current dir
-        try:
-            from claude_types import ClaudeRequest, ClaudeMessage, ClaudeTool
-        except ImportError:
-             # Last resort: if loaded via importlib in app.py, we might need to rely on app.py injecting it
-             # But app.py loads this module.
-             pass
+from claude_types import ClaudeRequest, ClaudeMessage, ClaudeTool
 
 logger = logging.getLogger(__name__)
 

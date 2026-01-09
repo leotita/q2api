@@ -1,46 +1,23 @@
+import asyncio
 import json
 import time
-import uuid
-import os
-import asyncio
 from typing import Dict, Tuple, Optional
 
 import httpx
 
-def _get_proxies() -> Optional[Dict[str, str]]:
-    proxy = os.getenv("HTTP_PROXY", "").strip()
-    if proxy:
-        return {"http": proxy, "https": proxy}
-    return None
+from http_client import create_mounts
+from token_refresh import OIDC_BASE, TOKEN_URL, make_headers
 
-# OIDC endpoints and constants (aligned with v1/auth_client.py)
-OIDC_BASE = "https://oidc.us-east-1.amazonaws.com"
+# OIDC endpoints
 REGISTER_URL = f"{OIDC_BASE}/client/register"
 DEVICE_AUTH_URL = f"{OIDC_BASE}/device_authorization"
-TOKEN_URL = f"{OIDC_BASE}/token"
 START_URL = "https://view.awsapps.com/start"
-
-USER_AGENT = "aws-sdk-rust/1.3.9 os/windows lang/rust/1.87.0"
-X_AMZ_USER_AGENT = "aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os/windows lang/rust/1.87.0 m/E app/AmazonQ-For-CLI"
-AMZ_SDK_REQUEST = "attempt=1; max=3"
-
-
-def make_headers() -> Dict[str, str]:
-    return {
-        "content-type": "application/json",
-        "user-agent": USER_AGENT,
-        "x-amz-user-agent": X_AMZ_USER_AGENT,
-        "amz-sdk-request": AMZ_SDK_REQUEST,
-        "amz-sdk-invocation-id": str(uuid.uuid4()),
-    }
 
 
 async def post_json(client: httpx.AsyncClient, url: str, payload: Dict) -> httpx.Response:
-    # Keep JSON order and mimic body closely to v1
     payload_str = json.dumps(payload, ensure_ascii=False)
     headers = make_headers()
-    resp = await client.post(url, headers=headers, content=payload_str, timeout=httpx.Timeout(15.0, read=60.0))
-    return resp
+    return await client.post(url, headers=headers, content=payload_str, timeout=httpx.Timeout(15.0, read=60.0))
 
 
 async def register_client_min() -> Tuple[str, str]:
@@ -56,16 +33,7 @@ async def register_client_min() -> Tuple[str, str]:
             "codewhisperer:conversations",
         ],
     }
-    proxies = _get_proxies()
-    mounts = None
-    if proxies:
-        proxy_url = proxies.get("https") or proxies.get("http")
-        if proxy_url:
-            mounts = {
-                "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-                "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-            }
-    async with httpx.AsyncClient(mounts=mounts) as client:
+    async with httpx.AsyncClient(mounts=create_mounts()) as client:
         r = await post_json(client, REGISTER_URL, payload)
         r.raise_for_status()
         data = r.json()
@@ -86,16 +54,7 @@ async def device_authorize(client_id: str, client_secret: str) -> Dict:
         "clientSecret": client_secret,
         "startUrl": START_URL,
     }
-    proxies = _get_proxies()
-    mounts = None
-    if proxies:
-        proxy_url = proxies.get("https") or proxies.get("http")
-        if proxy_url:
-            mounts = {
-                "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-                "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-            }
-    async with httpx.AsyncClient(mounts=mounts) as client:
+    async with httpx.AsyncClient(mounts=create_mounts()) as client:
         r = await post_json(client, DEVICE_AUTH_URL, payload)
         r.raise_for_status()
         return r.json()
@@ -132,17 +91,7 @@ async def poll_token_device_code(
     # Ensure interval sane
     poll_interval = max(1, int(interval or 1))
 
-    proxies = _get_proxies()
-    mounts = None
-    if proxies:
-        proxy_url = proxies.get("https") or proxies.get("http")
-        if proxy_url:
-            mounts = {
-                "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-                "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-            }
-    
-    async with httpx.AsyncClient(mounts=mounts) as client:
+    async with httpx.AsyncClient(mounts=create_mounts()) as client:
         while time.time() < deadline:
             r = await post_json(client, TOKEN_URL, payload)
             if r.status_code == 200:
