@@ -120,18 +120,53 @@ class AdminLoginResponse(BaseModel):
 
 
 # ------------------------------------------------------------------------------
-# Chat Models
+# Chat Models (OpenAI Compatible)
 # ------------------------------------------------------------------------------
 
+class OpenAIFunctionDef(BaseModel):
+    """OpenAI function definition"""
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+
+
+class OpenAIToolDef(BaseModel):
+    """OpenAI tool definition"""
+    type: str = "function"
+    function: OpenAIFunctionDef
+
+
+class OpenAIToolCallFunction(BaseModel):
+    """OpenAI tool call function info"""
+    name: str
+    arguments: str
+
+
+class OpenAIToolCall(BaseModel):
+    """OpenAI tool call in assistant message"""
+    id: str
+    type: str = "function"
+    function: OpenAIToolCallFunction
+
+
 class ChatMessage(BaseModel):
+    """OpenAI chat message format"""
     role: str
-    content: Any
+    content: Optional[Any] = None
+    tool_calls: Optional[List[OpenAIToolCall]] = None
+    tool_call_id: Optional[str] = None  # For tool response messages
+    name: Optional[str] = None  # Tool name for tool response
 
 
 class ChatCompletionRequest(BaseModel):
+    """OpenAI chat completion request"""
     model: Optional[str] = None
     messages: List[ChatMessage]
     stream: Optional[bool] = False
+    tools: Optional[List[OpenAIToolDef]] = None
+    tool_choice: Optional[Any] = None  # "auto", "none", or {"type": "function", "function": {"name": "..."}}
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
 
 
 # ------------------------------------------------------------------------------
