@@ -139,6 +139,19 @@ MAX_ERROR_COUNT: int = int(os.getenv("MAX_ERROR_COUNT", "100"))
 MAX_RETRY_COUNT: int = int(os.getenv("MAX_RETRY_COUNT", "3"))
 TOKEN_COUNT_MULTIPLIER: float = float(os.getenv("TOKEN_COUNT_MULTIPLIER", "1.0"))
 
+# Model mapping: MODEL_MAPPING=源模型:目标模型,源模型2:目标模型2
+def _parse_model_mapping() -> Dict[str, str]:
+    s = os.getenv("MODEL_MAPPING", "") or ""
+    mapping = {}
+    for pair in s.split(","):
+        if ":" in pair:
+            src, dst = pair.split(":", 1)
+            if src.strip() and dst.strip():
+                mapping[src.strip()] = dst.strip()
+    return mapping
+
+MODEL_MAPPING: Dict[str, str] = _parse_model_mapping()
+
 # Lazy Account Pool settings
 LAZY_ACCOUNT_POOL_ENABLED: bool = os.getenv("LAZY_ACCOUNT_POOL_ENABLED", "false").lower() in ("true", "1", "yes")
 LAZY_ACCOUNT_POOL_SIZE: int = int(os.getenv("LAZY_ACCOUNT_POOL_SIZE", "20"))
@@ -659,7 +672,9 @@ async def chat_completions(req: ChatCompletionRequest, account: Account = Depend
     - messages will be converted into "{role}:\n{content}" and injected into template
     - account is chosen randomly among enabled accounts (API key is for authorization only)
     """
-    model = map_model_name(req.model)
+    # Apply model mapping if configured
+    request_model = MODEL_MAPPING.get(req.model, req.model) if req.model else req.model
+    model = map_model_name(request_model)
     do_stream = bool(req.stream)
 
     async def _send_upstream(stream: bool) -> Tuple[Optional[str], Optional[AsyncGenerator[str, None]], Any]:
