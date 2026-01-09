@@ -159,6 +159,9 @@ def _parse_model_mapping() -> Dict[str, str]:
 
 MODEL_MAPPING: Dict[str, str] = _parse_model_mapping()
 
+# Debug settings
+DEBUG_OPENAI_CONVERSION: bool = os.getenv("DEBUG_OPENAI_CONVERSION", "false").lower() in ("true", "1", "yes")
+
 # Lazy Account Pool settings
 LAZY_ACCOUNT_POOL_ENABLED: bool = os.getenv("LAZY_ACCOUNT_POOL_ENABLED", "false").lower() in ("true", "1", "yes")
 LAZY_ACCOUNT_POOL_SIZE: int = int(os.getenv("LAZY_ACCOUNT_POOL_SIZE", "20"))
@@ -699,6 +702,13 @@ async def chat_completions(req: ChatCompletionRequest, account: Account = Depend
     tools_dict = [t.model_dump() for t in req.tools] if req.tools else None
     messages_dict = [m.model_dump() for m in req.messages]
     aq_request = convert_openai_messages_to_aq(messages_dict, tools=tools_dict, model=model)
+
+    # Debug logging
+    if DEBUG_OPENAI_CONVERSION:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[OpenAI Debug] Received request:\n{json.dumps(req.model_dump(), ensure_ascii=False, indent=2)}")
+        logger.info(f"[OpenAI Debug] Converted AWS Q request:\n{json.dumps(aq_request, ensure_ascii=False, indent=2)}")
 
     async def _send_upstream() -> Tuple[Any, Any, Any]:
         """发送请求到 AWS Q"""

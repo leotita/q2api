@@ -234,7 +234,6 @@ def convert_openai_messages_to_aq(
 
             assistant_msg = {
                 "assistantResponseMessage": {
-                    "messageId": str(uuid.uuid4()),
                     "content": text_content
                 }
             }
@@ -283,9 +282,10 @@ def convert_openai_messages_to_aq(
                     i += 1
 
                 # 创建一个带 toolResults 的 user 消息
+                # content 不能为空，使用占位符
                 history.append({
                     "userInputMessage": {
-                        "content": "",
+                        "content": "[Tool results]",
                         "userInputMessageContext": {
                             "toolResults": tool_results_batch
                         },
@@ -334,7 +334,7 @@ def convert_openai_messages_to_aq(
     }
 
     if aq_tools:
-        user_ctx["toolConfiguration"] = {"tools": aq_tools}
+        user_ctx["tools"] = aq_tools
 
     if current_tool_results:
         user_ctx["toolResults"] = current_tool_results
